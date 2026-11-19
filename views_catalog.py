@@ -26,6 +26,7 @@ from database import (
     get_favorites,
     get_inventory_map,
     insert_pending_synthese,
+    log_search,
     toggle_favorite,
 )
 from theme import safe_html
@@ -67,14 +68,36 @@ def _stock_badge_html(name: str, inv_map: dict) -> str:
     return f'<span class="stock-pill stock-ok">Stock · {qty:g} {html.escape(unit)}</span>'
 
 
-def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
-    username = app_state.get("username", "chercheur")
+def _check_synthesis_feasibility(row: dict, inv_map: dict) -> dict:
+    """Analyse la disponibilité de tous les réactifs d'une fiche."""
+    reas = [clean_val(row.get(f"Réactifs {i}")) for i in range(1, 5) if clean_val(row.get(f"Réactifs {i}"))]
+    missing = []
+    low = []
+    available = 0
+    for rea in reas:
+        info = inv_map.get(rea.lower())
+        if not info or info[0] <= 0:
+            missing.append(rea)
+        else:
+            available += 1
+            if info[0] <= info[2]:
+                low.append(rea)
+    return {
+        "total": len(reas),
+        "available": available,
+        "missing": missing,
+        "low": low,
+        "has_missing": len(missing) > 0,
+    }
 
-    fiche_dialog = ui.dialog()
+
+def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None, on_launch_in_labo=None):
+    # Modales translucides avec fade-in / fade-out natif
+    fiche_dialog = ui.dialog().props('transition-show="fade" transition-hide="fade"')
     with fiche_dialog:
         fiche_body = ui.element("div").classes("cb-modal-card")
 
-    inspector_dialog = ui.dialog()
+    inspector_dialog = ui.dialog().props('transition-show="fade" transition-hide="fade"')
     with inspector_dialog:
         inspector_body = ui.element("div").classes("cb-inspector-card")
 
@@ -190,12 +213,9 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
         data = await run.io_bound(fetch_reactant_inspector_data, rea_clean)
         pc_url, sig_url = await run.io_bound(get_safety_fds_links, data.get("cas", ""), rea_clean)
         depict_url = get_vector_depict_url(data["smiles"], style="cow", w=260, h=190, zoom=2.6) if data.get("smiles") else ""
-        stock_html = _stock_badge_html(rea_clean, inv_map) or '<span class="muted-small">Non référencé en stock</span>'
+        stock_html = _stock_badge_html(rea_clean, inv_map) or '<span class="stock-pill stock-empty">Non référencé en stock</span>'
 
-        iupac_html = ""
-        if data.get("iupac"):
-            iupac_html = f'<p class="muted-small" style="margin-top:10px;"><strong>IUPAC :</strong> {html.escape(data["iupac"])}</p>'
-
+        iupac_html = f'<p class="muted-small" style="margin-top:10px;"><strong>IUPAC :</strong> {html.escape(data["iupac"])}</p>' if data.get("iupac") else ""
         fds_btns = ""
         if pc_url:
             fds_btns += f'<a class="glass-btn" style="text-decoration:none;" href="{pc_url}" target="_blank">FDS PubChem LCSS ↗</a>'
@@ -265,12 +285,27 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
         stockage = clean_val(row.get("Conditions de stockage")) or "N/A"
         reactants = [clean_val(row.get(f"Réactifs {i}")) for i in range(1, 5) if clean_val(row.get(f"Réactifs {i}"))]
         inv_map = get_inventory_map()
+        feas = _check_synthesis_feasibility(row, inv_map)
         img_2d = _fast_card_2d_url(cas, prod)
         viewer_mode = {"mode": "2d"}
 
         cas_tag = f'<span class="mono-tag">CAS {html.escape(cas)}</span>' if cas else ""
         rdt_tag = f'<span class="yield-tag">Rdt {html.escape(rdt)}</span>' if rdt else ""
         comm_html = f'<p class="muted-text"><strong style="color:var(--txt);">Notes R&amp;D :</strong> {html.escape(comm)}</p>' if comm else ""
+
+        if feas["has_missing"]:
+            feas_pill = f'<span class="stock-pill stock-empty">Non réalisable · {len(feas["missing"])} réactif(s) manquant(s)</span>'
+        elif feas["low"]:
+            feas_pill = f'<span class="stock-pill stock-low">Réalisable · {feas["available"]}/{feas["total"]} réactifs (seuil bas)</span>'
+        elif feas["total"] > 0:
+            feas_pill = f'<span class="stock-pill stock-ok">Synthèse réalisable · {feas["available"]}/{feas["total"]} réactifs dispo</span>'
+        else:
+            feas_pill = ""
+
+        def launch_labo(_e=None):
+            fiche_dialog.close()
+            if callable(on_launch_in_labo):
+                on_launch_in_labo(prod)
 
         fiche_body.clear()
         with fiche_body:
@@ -279,16 +314,29 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
                     safe_html('<div class="section-kicker">SPÉCIFICATION TECHNIQUE &amp; SYNTHÈSE</div>')
                     safe_html(
                         f'<h2 style="margin:4px 0 4px 0;font-size:1.45rem;">{html.escape(prod)}</h2>'
-                        f'<div class="mol-subrow">{cas_tag}{rdt_tag}{_stock_badge_html(prod, inv_map)}</div>'
+                        f'<div class="mol-subrow">{cas_tag}{rdt_tag}{_stock_badge_html(prod, inv_map)}{feas_pill}</div>'
                     )
                 with ui.element("div").style("display:flex;gap:8px;flex-wrap:wrap;"):
                     _btn(
-                        "Exporter Fiche HTML",
+                        "Lancer dans le Cahier de Labo",
+                        classes="glass-btn glass-btn-accent",
+                        on_click=launch_labo,
+                    )
+                    _btn(
+                        "Exporter HTML",
                         on_click=lambda _e, r=row, p=prod: ui.download(
                             generate_molecule_html(r), f"Fiche_{sanitize_filename(p)}.html"
                         ),
                     )
                     _btn("Fermer ✕", on_click=lambda _e: fiche_dialog.close())
+
+            if feas["has_missing"]:
+                safe_html(
+                    f'<div class="warning-banner" style="padding:10px 14px;margin-bottom:14px;">'
+                    f'<span style="font-size:0.84rem;color:var(--txt);">'
+                    f'<strong style="color:var(--danger);">Réactif(s) en rupture ou absent(s) du stock :</strong> '
+                    f'{html.escape(", ".join(feas["missing"]))}</span></div>'
+                )
 
             with ui.element("div").classes("modal-grid"):
                 with ui.element("div"):
@@ -320,10 +368,12 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
                             with ui.element("div").style("display:flex;flex-wrap:wrap;gap:8px;"):
                                 for rea in reactants:
                                     s_info = inv_map.get(rea.lower())
-                                    dot = ""
-                                    if s_info:
-                                        dot_c = "status-err" if s_info[0] <= 0 else ("status-warn" if s_info[0] <= s_info[2] else "status-ok")
-                                        dot = f'<span class="status-dot {dot_c}"></span>'
+                                    if not s_info or s_info[0] <= 0:
+                                        dot = '<span class="status-dot status-err"></span>'
+                                    elif s_info[0] <= s_info[2]:
+                                        dot = '<span class="status-dot status-warn"></span>'
+                                    else:
+                                        dot = '<span class="status-dot status-ok"></span>'
                                     _btn(
                                         f"{dot}<span>{html.escape(rea)}</span>",
                                         classes="rea-pill-click",
@@ -454,26 +504,26 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
         })
 
         filters = {"q": "", "rx": "Toutes", "rea": "Tous", "fav_only": False}
+        log_timer = {"ref": None}
 
         with ui.element("div").classes("filter-bar"):
             q_input = ui.input(
                 placeholder="Rechercher une molécule, un CAS, une réaction ou un réactif..."
             ).props("outlined dense clearable")
-            rx_select = ui.select(
-                ["Toutes"] + reactions_list, value="Toutes", label="Réaction"
-            ).props("outlined dense")
-            rea_select = ui.select(
-                ["Tous"] + reactants_list, value="Tous", label="Réactif"
-            ).props("outlined dense")
+            rx_select = ui.select(["Toutes"] + reactions_list, value="Toutes", label="Réaction").props("outlined dense")
+            rea_select = ui.select(["Tous"] + reactants_list, value="Tous", label="Réactif").props("outlined dense")
             fav_check = ui.checkbox("Favoris uniquement")
             export_btn = _btn("Export Excel (.xls)", style="height:40px;")
 
         meta_slot = ui.element("div").classes("catalog-meta-row")
         grid_slot = ui.element("div")
 
+        def current_username():
+            return app_state.get("username", "chercheur")
+
         def get_filtered_rows():
             rows = get_all_syntheses()
-            favs = get_favorites(username)
+            favs = get_favorites(current_username())
             q = clean_val(filters["q"]).lower()
             rx_f = filters["rx"]
             rea_f = filters["rea"]
@@ -501,13 +551,34 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
             filters.update(q="", rx="Toutes", rea="Tous", fav_only=False)
             refresh_grid()
 
+        def schedule_zero_result_log(q_text: str):
+            if log_timer["ref"] is not None:
+                log_timer["ref"].cancel()
+                log_timer["ref"] = None
+            if len(clean_val(q_text)) < 2:
+                return
+            log_timer["ref"] = ui.timer(
+                1.5,
+                lambda q=q_text, rx=filters["rx"], rea=filters["rea"]: log_search(q, "", rx, rea, 0),
+                once=True,
+            )
+
         def refresh_grid():
             filtered, favs = get_filtered_rows()
             inv_map = get_inventory_map()
 
+            if len(filtered) == 0 and clean_val(filters["q"]):
+                schedule_zero_result_log(filters["q"])
+            elif log_timer["ref"] is not None:
+                log_timer["ref"].cancel()
+                log_timer["ref"] = None
+
+            missing_cards = sum(1 for r in filtered if _check_synthesis_feasibility(r, inv_map)["has_missing"])
+
             meta_slot.clear()
             with meta_slot:
-                safe_html(f"<span>{len(filtered)} FICHE(S) AFFICHÉE(S) · CLIC SUR UNE CARTE POUR OUVRIR L'INSPECTEUR 2D/3D</span>")
+                warn_txt = f" · {missing_cards} AVEC RÉACTIF MANQUANT (BANDE ROUGE)" if missing_cards > 0 else ""
+                safe_html(f"<span>{len(filtered)} FICHE(S) AFFICHÉE(S){warn_txt}</span>")
                 if filters["q"] or filters["rx"] != "Toutes" or filters["rea"] != "Tous" or filters["fav_only"]:
                     _btn("Réinitialiser les filtres", style="padding:4px 10px;font-size:0.72rem;", on_click=reset_filters)
 
@@ -517,7 +588,7 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
                     safe_html(
                         '<div class="hud-card"><div class="section-kicker">AUCUN RÉSULTAT</div>'
                         '<h2>Aucune molécule ne correspond à vos filtres</h2>'
-                        '<p class="muted-text">Essayez un autre terme de recherche ou proposez une nouvelle fiche dans l\'onglet dédié.</p></div>'
+                        '<p class="muted-text">Cette recherche est enregistrée pour la veille catalogue. Vous pouvez aussi proposer cette fiche dans l\'onglet dédié.</p></div>'
                     )
                     return
 
@@ -531,22 +602,29 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
                         reas = [clean_val(row.get(f"Réactifs {i}")) for i in range(1, 5) if clean_val(row.get(f"Réactifs {i}"))]
                         img_2d = _fast_card_2d_url(cas, prod)
                         is_fav = prod in favs
+                        feas = _check_synthesis_feasibility(row, inv_map)
 
+                        card_cls = "mol-card mol-card-missing" if feas["has_missing"] else "mol-card"
                         cas_tag = f'<span class="mono-tag">CAS {html.escape(cas)}</span>' if cas else ""
                         rdt_tag = f'<span class="yield-tag">Rdt {html.escape(rdt)}</span>' if rdt else ""
+                        miss_tag = (
+                            f'<span class="stock-pill stock-empty">Manque : {html.escape(feas["missing"][0])}{" +" if len(feas["missing"]) > 1 else ""}</span>'
+                            if feas["has_missing"]
+                            else ""
+                        )
 
-                        with ui.element("article").classes("mol-card").on("click", make_open_fiche_handler(row)):
+                        with ui.element("article").classes(card_cls).on("click", make_open_fiche_handler(row)):
                             safe_html(HEX_WATERMARK_SVG)
 
                             with ui.element("div").classes("mol-card-top"):
                                 with ui.element("div"):
                                     safe_html(f'<h3 class="mol-title">{html.escape(prod)}</h3>')
-                                    safe_html(f'<div class="mol-subrow">{cas_tag}{rdt_tag}{_stock_badge_html(prod, inv_map)}</div>')
+                                    safe_html(f'<div class="mol-subrow">{cas_tag}{rdt_tag}{_stock_badge_html(prod, inv_map)}{miss_tag}</div>')
 
                                 fav_cls = "fav-btn is-fav" if is_fav else "fav-btn"
                                 fav_btn = ui.element("button").classes(fav_cls).props(
                                     'title="Ajouter / Retirer des favoris"'
-                                ).on("click.stop", lambda _e, p=prod: (toggle_favorite(username, p), refresh_grid()))
+                                ).on("click.stop", lambda _e, p=prod: (toggle_favorite(current_username(), p), refresh_grid()))
                                 with fav_btn:
                                     safe_html("★" if is_fav else "☆")
 
@@ -590,7 +668,7 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
         return refresh_grid
 
     # ------------------------------------------------------------------
-    # ONGLET 5 : NOUVELLE FICHE (AVEC AUTO-REMPLISSAGE PUBCHEM)
+    # ONGLET 5 : NOUVELLE FICHE (AUTO-REMPLISSAGE PUBCHEM)
     # ------------------------------------------------------------------
     def render_proposal_tab():
         with ui.element("div").classes("hud-card"):
@@ -686,4 +764,4 @@ def build_catalog_and_proposal_views(app_state: dict, on_data_changed=None):
                     on_click=on_submit_fiche,
                 )
 
-    return render_catalog_tab, render_proposal_tab
+    return render_catalog_tab, render_proposal_tab, open_fiche

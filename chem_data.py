@@ -10,8 +10,7 @@ from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMG_DIR = os.path.join(BASE_DIR, "images")
-PICTO_DIR = os.path.join(IMG_DIR, "pictogrammes")
-ELN_FILES_DIR = os.path.join(IMG_DIR, "eln_attachments")
+LABO_FILES_DIR = os.path.join(IMG_DIR, "labo_attachments")
 
 SGH_DICT = {
     "SGH01": ("Explosif", "sgh01.png"),
@@ -22,6 +21,67 @@ SGH_DICT = {
     "SGH07": ("Nocif / Irritant", "sgh07.png"),
     "SGH08": ("Danger santé / CMR", "sgh08.png"),
     "SGH09": ("Dangereux env.", "sgh09.png"),
+}
+
+
+def _sgh_diamond(inner_svg: str) -> str:
+    return (
+        '<svg class="sgh-svg" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+        '<polygon points="32,3 61,32 32,61 3,32" fill="#ffffff" stroke="#dc2626" stroke-width="4.4" stroke-linejoin="round"/>'
+        f"{inner_svg}"
+        "</svg>"
+    )
+
+
+SGH_SVG_MAP = {
+    "SGH01": _sgh_diamond(
+        '<circle cx="24" cy="36" r="6.2" fill="#111827"/>'
+        '<path d="M29 31 L34 26 M32 22 L35 16 M38 25 L45 21 M39 32 L47 32 M37 38 L44 43 M31 41 L34 48" stroke="#111827" stroke-width="2.4" stroke-linecap="round"/>'
+        '<polygon points="34,26 39,23 37,29 42,32 36,34 38,39 33,35 29,31" fill="#111827"/>'
+    ),
+    "SGH02": _sgh_diamond(
+        '<path d="M32 15 C36 22 42 26 42 34 C42 40 37.5 44 32 44 C26.5 44 22 40 22 34 C22 29 25 25 27 22 C26.5 26 28.5 28 30 27 C29 22 30.5 18 32 15 Z" fill="#111827"/>'
+        '<path d="M32 31 C34 34 35.5 36 35.5 38.5 C35.5 41 34 42.5 32 42.5 C30 42.5 28.5 41 28.5 38.5 C28.5 36.5 30 34 32 31 Z" fill="#ffffff"/>'
+        '<line x1="21" y1="47" x2="43" y2="47" stroke="#111827" stroke-width="2.6" stroke-linecap="round"/>'
+    ),
+    "SGH04": _sgh_diamond(
+        '<g transform="rotate(-45 32 32)">'
+        '<rect x="16" y="26.5" width="26" height="11" rx="5.5" fill="#111827"/>'
+        '<rect x="41" y="29.5" width="5" height="5" rx="1" fill="#111827"/>'
+        '<line x1="46" y1="27.5" x2="46" y2="36.5" stroke="#111827" stroke-width="2.4" stroke-linecap="round"/>'
+        '</g>'
+    ),
+    "SGH05": _sgh_diamond(
+        '<path d="M18 22 L28 28 L26 31 L16 25 Z" fill="#111827"/>'
+        '<path d="M46 22 L36 28 L38 31 L48 25 Z" fill="#111827"/>'
+        '<circle cx="26" cy="34.5" r="1.7" fill="#111827"/>'
+        '<circle cx="38" cy="34.5" r="1.7" fill="#111827"/>'
+        '<path d="M16 41 L29 41 L29 45 L16 45 Z" fill="#111827"/>'
+        '<path d="M35 41 C37 39 42 39 47 41 C48 42.5 47 45 45 45 L35 45 Z" fill="#111827"/>'
+    ),
+    "SGH06": _sgh_diamond(
+        '<path d="M23 28 C23 21.5 27 18 32 18 C37 18 41 21.5 41 28 C41 31.5 39 34 37.2 35 L37.2 38 L26.8 38 L26.8 35 C25 34 23 31.5 23 28 Z" fill="#111827"/>'
+        '<circle cx="28.3" cy="28" r="2.3" fill="#ffffff"/>'
+        '<circle cx="35.7" cy="28" r="2.3" fill="#ffffff"/>'
+        '<polygon points="32,31 30.5,34 33.5,34" fill="#ffffff"/>'
+        '<line x1="20" y1="45" x2="44" y2="38" stroke="#111827" stroke-width="2.8" stroke-linecap="round"/>'
+        '<line x1="20" y1="38" x2="44" y2="45" stroke="#111827" stroke-width="2.8" stroke-linecap="round"/>'
+    ),
+    "SGH07": _sgh_diamond(
+        '<path d="M29.2 19 C29.2 17.5 30.4 16.5 32 16.5 C33.6 16.5 34.8 17.5 34.8 19 L33.8 36.5 C33.7 37.6 32.9 38.3 32 38.3 C31.1 38.3 30.3 37.6 30.2 36.5 Z" fill="#111827"/>'
+        '<circle cx="32" cy="44.5" r="3.2" fill="#111827"/>'
+    ),
+    "SGH08": _sgh_diamond(
+        '<circle cx="32" cy="21" r="4.3" fill="#111827"/>'
+        '<path d="M21 44 C21.5 33 25 27.5 32 27.5 C39 27.5 42.5 33 43 44 Z" fill="#111827"/>'
+        '<polygon points="32,29 33.6,33.5 38.2,32.5 35,36 37.8,39.8 33.3,38.4 32,43 30.7,38.4 26.2,39.8 29,36 25.8,32.5 30.4,33.5" fill="#ffffff"/>'
+    ),
+    "SGH09": _sgh_diamond(
+        '<path d="M26 42 L26 24 M26 30 L20 25 M26 27 L31 21 M26 33 L32 29" stroke="#111827" stroke-width="2.4" stroke-linecap="round"/>'
+        '<path d="M16 42 Q24 39 32 42 T48 42" fill="none" stroke="#111827" stroke-width="2.2"/>'
+        '<path d="M33 46 C36 42.5 42 42.5 45 45.5 C42 48.5 36 48.5 33 46 Z" fill="#111827"/>'
+        '<polygon points="33,46 29.5,43.8 29.5,48.2" fill="#111827"/>'
+    ),
 }
 
 BASE_COLS = [
@@ -311,7 +371,6 @@ def get_known_density(name_or_cas, fallback=1.0) -> float:
 
 
 def export_styled_table(rows: list, columns: list, title="Export ChemBase") -> bytes:
-    """Génère un fichier Excel (.xls) mis en forme sans dépendre de pandas."""
     ths = "".join([
         f"<th style='background-color:#065f46;color:#ffffff;font-weight:bold;border:1px solid #94a3b8;padding:8px 12px;text-align:left;font-family:Consolas,monospace;font-size:12px;'>{html.escape(str(c))}</th>"
         for c in columns
@@ -535,7 +594,6 @@ def fetch_full_pubchem_by_cas(cas_str: str):
 
 @lru_cache(maxsize=128)
 def fetch_reactant_inspector_data(reactant_name: str) -> dict:
-    """Propriétés complètes d'un réactif pour la Vue Inspecteur."""
     name = clean_val(reactant_name)
     smi = get_smiles(name)
     mw_fast = get_molecular_weight(name)
@@ -613,7 +671,6 @@ def fetch_reactant_inspector_data(reactant_name: str) -> dict:
 
 
 def build_3dmol_html(cas_str: str, dark_mode: bool = True) -> str:
-    """Page autonome légère servie dans une iframe pour la visualisation 3Dmol.js."""
     cas = clean_val(cas_str)
     bg = "#0b1212" if dark_mode else "#ffffff"
     txt = "#94a3b8" if dark_mode else "#475569"
@@ -647,34 +704,28 @@ def build_3dmol_html(cas_str: str, dark_mode: bool = True) -> str:
 
 
 def render_pictograms_html(picto_str: str) -> str:
-    """Retourne un bloc HTML propre des pictogrammes SGH (images locales si présentes, sinon badges)."""
+    """Pictogrammes SGH vectoriels SVG intégrés directement dans le code (zéro dépendance PNG)."""
     raw = clean_val(picto_str)
     if not raw:
         return '<span class="muted-small">Aucun danger majeur classé</span>'
     valid = []
     seen = set()
     for c in [x.strip().upper() for x in raw.split(",") if x.strip()]:
-        for k, (lbl, fn) in SGH_DICT.items():
+        for k, (lbl, _fn) in SGH_DICT.items():
             if (k in c or lbl.lower() in c.lower()) and k not in seen:
                 seen.add(k)
-                valid.append((k, lbl, fn))
+                valid.append((k, lbl))
                 break
     if not valid:
         return f'<span class="mono-tag">{html.escape(raw)}</span>'
     items = []
-    for code, lbl, fn in valid:
-        local_path = os.path.join(PICTO_DIR, fn)
-        if os.path.exists(local_path):
-            items.append(
-                f'<div class="sgh-item" title="{html.escape(lbl)}">'
-                f'<img src="/images/pictogrammes/{fn}" alt="{code}" />'
-                f'<span>{code}</span></div>'
-            )
-        else:
-            items.append(
-                f'<div class="sgh-badge" title="{html.escape(lbl)}">'
-                f'<strong>{code}</strong><small>{html.escape(lbl)}</small></div>'
-            )
+    for code, lbl in valid:
+        svg_markup = SGH_SVG_MAP.get(code, "")
+        items.append(
+            f'<div class="sgh-item" title="{html.escape(code + " — " + lbl)}">'
+            f"{svg_markup}"
+            f"<span>{code}</span></div>"
+        )
     return f'<div class="sgh-row">{"".join(items)}</div>'
 
 
