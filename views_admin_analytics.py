@@ -1,21 +1,27 @@
 from collections import Counter
+from datetime import datetime
 import html
 import re
-from nicegui import app, ui
+from typing import Any
+from nicegui import app, run, ui
 
-from chem_data import BASE_COLS, SGH_DICT, clean_val
+from chem_data import SGH_DICT, clean_val
 from database import (
     acknowledge_user_warnings,
     approve_pending_synthese,
-    authenticate_user,
     create_user,
     delete_synthese_by_id,
     delete_user_account,
     dismiss_password_reset,
+    get_activity_logs,
+    get_activity_usernames,
     get_all_labo_entries,
     get_all_syntheses,
     get_all_users,
     get_audit_logs,
+    get_db_backup_bytes,
+    get_github_sync_status,
+    get_lab_registration_settings,
     get_pending_password_resets,
     get_pending_syntheses,
     get_stock_alerts,
@@ -24,8 +30,9 @@ from database import (
     mark_all_alerts_read,
     read_db_status,
     reject_pending_synthese,
-    request_password_reset,
     resolve_password_reset,
+    sync_db_to_github,
+    update_lab_registration_settings,
     update_synthese_by_id,
     update_user_account,
     veto_audit_action,
@@ -33,6 +40,7 @@ from database import (
 from theme import safe_html
 
 SGH_OPTIONS = [f"{code} - {lbl}" for code, (lbl, _fn) in SGH_DICT.items()]
+ACTIVITY_CATEGORIES = ["Toutes", "CONNEXION", "INSCRIPTION", "STOCK", "LABO", "PROPOSITION", "CATALOGUE", "ADMIN", "COMPTE"]
 
 
 def _btn(label_html: str, classes: str = "glass-btn", on_click=None, style: str = "", props: str = ""):
@@ -48,7 +56,7 @@ def _btn(label_html: str, classes: str = "glass-btn", on_click=None, style: str 
     return el
 
 
-def _extract_yield_number(val: str):
+def _extract_yield_number(val: str) -> float | None:
     m = re.search(r"(\d+(?:\.\d+)?)", clean_val(val).replace(",", "."))
     if not m:
         return None
@@ -56,8 +64,7 @@ def _extract_yield_number(val: str):
     return v if 0 <= v <= 100 else None
 
 
-def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
-    # Modales translucides en fade pour l'édition de fiche et la gestion des comptes
+def build_analytics_and_admin_views(app_state: dict[str, Any], on_data_changed=None):
     edit_fiche_dialog = ui.dialog().props('transition-show="fade" transition-hide="fade"')
     with edit_fiche_dialog:
         edit_fiche_body = ui.element("div").classes("cb-modal-card")
@@ -70,8 +77,29 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
     with reset_pwd_dialog:
         reset_pwd_body = ui.element("div").classes("cb-inspector-card").style("width:min(460px, 92vw) !important;")
 
+    confirm_dialog = ui.dialog().props('transition-show="fade" transition-hide="fade"')
+    with confirm_dialog:
+        confirm_body = ui.element("div").classes("cb-confirm-card")
+
+    def open_confirm_action(title: str, description: str, confirm_label: str, on_confirm):
+        confirm_body.clear()
+        with confirm_body:
+            safe_html(
+                '<div class="section-kicker" style="color:var(--danger);">CONFIRMATION REQUISE</div>'
+                f'<h2 style="margin:6px 0 8px 0;font-size:1.2rem;">{html.escape(title)}</h2>'
+                f'<p class="muted-text" style="margin-bottom:18px;">{html.escape(description)}</p>'
+            )
+            with ui.element("div").style("display:flex;justify-content:flex-end;gap:10px;"):
+                _btn("Annuler", on_click=lambda _e: confirm_dialog.close())
+                _btn(
+                    html.escape(confirm_label),
+                    classes="glass-btn glass-btn-danger",
+                    on_click=lambda _e: (confirm_dialog.close(), on_confirm()),
+                )
+        confirm_dialog.open()
+
     # ------------------------------------------------------------------
-    # ONGLET 4 : ANALYTIQUE R&D (REGROUPE TOUS LES KPI + GRAPHIQUES)
+    # ONGLET 4 : ANALYTIQUE R&D (KPI + GRAPHIQUES ADAPTATIFS CLAIR/SOMBRE)
     # ------------------------------------------------------------------
     def render_analytics_tab():
         container = ui.element("div")
@@ -82,14 +110,24 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
             labo_entries = get_all_labo_entries()
             zero_searches = get_zero_result_searches()
 
-            cat_yields = [y for r in syntheses if (y := _extract_yield_number(r.get("Rendement"))) is not None]
+            is_dark = bool(app_state.get("dark", True))
+            ax_txt = "#94a3b8" if is_dark else "#475569"
+            ax_line = "rgba(148,163,184,0.30)" if is_dark else "rgba(15,23,42,0.22)"
+            split_line = "rgba(148,163,184,0.14)" if is_dark else "rgba(15,23,42,0.09)"
+            tip_bg = "rgba(15,23,23,0.94)" if is_dark else "rgba(255,255,255,0.96)"
+            tip_txt = "#e6edf3" if is_dark else "#0f172a"
+            col_green = "#10b981" if is_dark else "#059669"
+            col_cyan = "#38bdf8" if is_dark else "#0284c7"
+            col_warn = "#f59e0b" if is_dark else "#d97706"
+
+            cat_yields = [y for r in syntheses if (y := _extract_yield_number(clean_val(r.get("Rendement")))) is not None]
             labo_yields = [float(e.get("rendement_reel") or 0.0) for e in labo_entries]
             avg_cat = (sum(cat_yields) / len(cat_yields)) if cat_yields else 0.0
             avg_labo = (sum(labo_yields) / len(labo_yields)) if labo_yields else 0.0
 
-            sgh_counter = Counter()
-            rea_counter = Counter()
-            rx_counter = Counter()
+            sgh_counter: Counter[str] = Counter()
+            rea_counter: Counter[str] = Counter()
+            rx_counter: Counter[str] = Counter()
 
             for r in syntheses:
                 picto_raw = clean_val(r.get("Pictogrammes danger")).upper()
@@ -123,7 +161,6 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
 
             container.clear()
             with container:
-                # Ligne 1 : KPI globaux de la plateforme (uniquement visibles ici)
                 safe_html(
                     f"""
                     <div class="kpi-grid">
@@ -165,31 +202,35 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                     """
                 )
 
-                # Graphiques ligne 1 : Rendements & SGH
                 with ui.element("div").classes("modal-grid").style("margin-bottom:16px;"):
                     with ui.element("div").classes("hud-card"):
                         safe_html('<div class="section-kicker">PERFORMANCE SYNTHÉTIQUE</div><h2>Répartition des Rendements Catalogue</h2>')
                         ui.echart({
                             "backgroundColor": "transparent",
-                            "tooltip": {"trigger": "axis"},
+                            "tooltip": {
+                                "trigger": "axis",
+                                "backgroundColor": tip_bg,
+                                "borderColor": col_green,
+                                "textStyle": {"color": tip_txt},
+                            },
                             "grid": {"left": 38, "right": 18, "top": 20, "bottom": 34},
                             "xAxis": {
                                 "type": "category",
                                 "data": list(buckets.keys()),
-                                "axisLabel": {"color": "#94a3b8"},
-                                "axisLine": {"lineStyle": {"color": "rgba(148,163,184,0.3)"}},
+                                "axisLabel": {"color": ax_txt},
+                                "axisLine": {"lineStyle": {"color": ax_line}},
                             },
                             "yAxis": {
                                 "type": "value",
                                 "minInterval": 1,
-                                "axisLabel": {"color": "#94a3b8"},
-                                "splitLine": {"lineStyle": {"color": "rgba(148,163,184,0.14)"}},
+                                "axisLabel": {"color": ax_txt},
+                                "splitLine": {"lineStyle": {"color": split_line}},
                             },
                             "series": [{
                                 "type": "bar",
                                 "barWidth": "46%",
                                 "data": list(buckets.values()),
-                                "itemStyle": {"borderRadius": [6, 6, 0, 0], "color": "#10b981"},
+                                "itemStyle": {"borderRadius": [6, 6, 0, 0], "color": col_green},
                             }],
                         }).style("height:240px;width:100%;")
 
@@ -199,29 +240,34 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                         if sgh_sorted:
                             ui.echart({
                                 "backgroundColor": "transparent",
-                                "tooltip": {"trigger": "item"},
+                                "tooltip": {
+                                    "trigger": "item",
+                                    "backgroundColor": tip_bg,
+                                    "borderColor": col_warn,
+                                    "textStyle": {"color": tip_txt},
+                                },
                                 "grid": {"left": 65, "right": 20, "top": 15, "bottom": 28},
                                 "xAxis": {
                                     "type": "value",
                                     "minInterval": 1,
-                                    "axisLabel": {"color": "#94a3b8"},
-                                    "splitLine": {"lineStyle": {"color": "rgba(148,163,184,0.14)"}},
+                                    "axisLabel": {"color": ax_txt},
+                                    "splitLine": {"lineStyle": {"color": split_line}},
                                 },
                                 "yAxis": {
                                     "type": "category",
                                     "data": [f"{k}" for k, _v in reversed(sgh_sorted)],
-                                    "axisLabel": {"color": "#94a3b8"},
+                                    "axisLabel": {"color": ax_txt},
+                                    "axisLine": {"lineStyle": {"color": ax_line}},
                                 },
                                 "series": [{
                                     "type": "bar",
                                     "data": [v for _k, v in reversed(sgh_sorted)],
-                                    "itemStyle": {"borderRadius": [0, 6, 6, 0], "color": "#f59e0b"},
+                                    "itemStyle": {"borderRadius": [0, 6, 6, 0], "color": col_warn},
                                 }],
                             }).style("height:240px;width:100%;")
                         else:
                             safe_html('<p class="muted-text">Aucun pictogramme SGH renseigné dans le catalogue.</p>')
 
-                # Graphiques ligne 2 : Top Réactifs & Recherches sans résultat
                 with ui.element("div").classes("modal-grid"):
                     with ui.element("div").classes("hud-card"):
                         safe_html('<div class="section-kicker">CONSOMMATION R&amp;D</div><h2>Top 8 des Réactifs les plus utilisés</h2>')
@@ -229,23 +275,29 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                         if top8:
                             ui.echart({
                                 "backgroundColor": "transparent",
-                                "tooltip": {"trigger": "axis"},
+                                "tooltip": {
+                                    "trigger": "axis",
+                                    "backgroundColor": tip_bg,
+                                    "borderColor": col_cyan,
+                                    "textStyle": {"color": tip_txt},
+                                },
                                 "grid": {"left": 145, "right": 22, "top": 10, "bottom": 26},
                                 "xAxis": {
                                     "type": "value",
                                     "minInterval": 1,
-                                    "axisLabel": {"color": "#94a3b8"},
-                                    "splitLine": {"lineStyle": {"color": "rgba(148,163,184,0.14)"}},
+                                    "axisLabel": {"color": ax_txt},
+                                    "splitLine": {"lineStyle": {"color": split_line}},
                                 },
                                 "yAxis": {
                                     "type": "category",
                                     "data": [k[:22] for k, _v in reversed(top8)],
-                                    "axisLabel": {"color": "#94a3b8", "fontSize": 11},
+                                    "axisLabel": {"color": ax_txt, "fontSize": 11},
+                                    "axisLine": {"lineStyle": {"color": ax_line}},
                                 },
                                 "series": [{
                                     "type": "bar",
                                     "data": [v for _k, v in reversed(top8)],
-                                    "itemStyle": {"borderRadius": [0, 6, 6, 0], "color": "#38bdf8"},
+                                    "itemStyle": {"borderRadius": [0, 6, 6, 0], "color": col_cyan},
                                 }],
                             }).style("height:260px;width:100%;")
                         else:
@@ -273,18 +325,19 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
         return refresh_analytics
 
     # ------------------------------------------------------------------
-    # ONGLET 6 : ADMINISTRATION, MODÉRATION, VETO & COMPTES
+    # ONGLET 6 : ADMINISTRATION, MODÉRATION, ACTIVITÉ LABO, VETO, COMPTES & BACKUP
     # ------------------------------------------------------------------
     def render_admin_tab():
         admin_root = ui.element("div")
-        sub_state = {"section": "moderation", "forgot_mode": False}
+        sub_state: dict[str, Any] = {"section": "moderation"}
+        act_filters: dict[str, str] = {"user": "Tous", "cat": "Toutes"}
 
         def notify_all():
             refresh_admin()
             if callable(on_data_changed):
                 on_data_changed()
 
-        def open_edit_fiche_modal(row: dict, adm_name: str):
+        def open_edit_fiche_modal(row: dict[str, Any], adm_name: str):
             sid = int(row["id"])
             raw_sgh = clean_val(row.get("Pictogrammes danger")).upper()
             init_sgh = [opt for opt in SGH_OPTIONS if opt.split(" - ")[0] in raw_sgh]
@@ -352,59 +405,77 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
 
             edit_fiche_dialog.open()
 
-        def open_user_manage_modal(target_user: dict, actor_name: str):
+        def open_user_manage_modal(target_user: dict[str, Any], actor_name: str, actor_is_root: bool):
             is_target_super = target_user["role"] == "superadmin"
+            is_target_root = bool(target_user.get("is_root", False))
             uid = int(target_user["id"])
+
+            if is_target_root and not actor_is_root:
+                ui.notify("Le compte Super-Admin fondateur est intouchable.", type="negative")
+                return
 
             user_body.clear()
             with user_body:
                 with ui.element("div").classes("modal-head"):
                     with ui.element("div"):
-                        safe_html('<div class="section-kicker">GESTION DE COMPTE · SUPER-ADMIN</div>')
-                        safe_html(f'<h2 style="margin:4px 0 0 0;font-size:1.25rem;">Compte : {html.escape(target_user["username"])}</h2>')
+                        kicker = "SUPER-ADMIN FONDATEUR · PLEINS POUVOIRS" if actor_is_root else "GESTION DE COMPTE · SUPER-ADMIN"
+                        safe_html(f'<div class="section-kicker">{kicker}</div>')
+                        root_tag = ' <span class="root-badge">FONDATEUR</span>' if is_target_root else ""
+                        safe_html(f'<h2 style="margin:4px 0 0 0;font-size:1.25rem;">Compte : {html.escape(target_user["username"])}{root_tag}</h2>')
                     _btn("Fermer ✕", on_click=lambda _e: user_dialog.close())
 
                 in_uname = ui.input(label="Identifiant", value=target_user["username"]).props("outlined dense").style("width:100%;margin-bottom:10px;")
+
+                role_options = ["superadmin"] if is_target_root else ["superadmin", "admin", "chercheur"]
                 in_role = ui.select(
-                    ["superadmin", "admin", "chercheur"],
-                    value=target_user["role"] if target_user["role"] in ("superadmin", "admin", "chercheur") else "admin",
+                    role_options,
+                    value=target_user["role"] if target_user["role"] in role_options else "admin",
                     label="Rôle (promouvoir / rétrograder)",
-                ).props("outlined dense").style("width:100%;margin-bottom:10px;")
+                ).props("outlined dense" + (" disable" if is_target_root else "")).style("width:100%;margin-bottom:10px;")
+
                 in_new_pwd = ui.input(
                     label="Nouveau mot de passe (laisser vide pour ne pas changer)",
                     password=True,
                     password_toggle_button=True,
                 ).props("outlined dense").style("width:100%;margin-bottom:12px;")
 
-                in_confirm_super = None
-                if is_target_super:
-                    safe_html(
-                        '<div class="warning-banner" style="padding:10px 14px;margin-bottom:12px;">'
-                        '<span style="font-size:0.82rem;color:var(--txt);">'
-                        '<strong style="color:var(--danger);">Protection Super-Admin :</strong> '
-                        'pour modifier, rétrograder ou supprimer ce compte Super-Admin, saisissez <strong>son mot de passe actuel</strong>.</span></div>'
-                    )
-                    in_confirm_super = ui.input(
-                        label=f"Mot de passe actuel de {target_user['username']} *",
-                        password=True,
-                        password_toggle_button=True,
-                    ).props("outlined dense").style("width:100%;margin-bottom:12px;")
+                in_confirm_super: Any = None
+                if is_target_super and not is_target_root:
+                    if actor_is_root:
+                        safe_html(
+                            '<div class="detail-box" style="padding:10px 14px;margin-bottom:12px;">'
+                            '<span class="muted-small" style="color:var(--accent);">'
+                            '<strong>Privilège Fondateur actif :</strong> vous pouvez modifier, rétrograder ou supprimer ce compte Super-Admin sans saisir son mot de passe.</span></div>'
+                        )
+                    else:
+                        safe_html(
+                            '<div class="warning-banner" style="padding:10px 14px;margin-bottom:12px;">'
+                            '<span style="font-size:0.82rem;color:var(--txt);">'
+                            '<strong style="color:var(--danger);">Protection Super-Admin :</strong> '
+                            'pour modifier, rétrograder ou supprimer ce compte Super-Admin, saisissez <strong>son mot de passe actuel</strong>.</span></div>'
+                        )
+                        in_confirm_super = ui.input(
+                            label=f"Mot de passe actuel de {target_user['username']} *",
+                            password=True,
+                            password_toggle_button=True,
+                        ).props("outlined dense").style("width:100%;margin-bottom:12px;")
 
                 def do_save_user(_e=None):
-                    conf = in_confirm_super.value if in_confirm_super is not None else ""
+                    conf = str(in_confirm_super.value or "") if in_confirm_super is not None else ""
                     ok, msg = update_user_account(
                         target_user_id=uid,
-                        new_username=in_uname.value or "",
-                        new_password=in_new_pwd.value or "",
-                        new_role=in_role.value or "admin",
-                        confirm_super_pwd=conf or "",
+                        new_username=str(in_uname.value or ""),
+                        new_password=str(in_new_pwd.value or ""),
+                        new_role=str(in_role.value or "admin"),
+                        confirm_super_pwd=conf,
                         actor_username=actor_name,
+                        actor_is_root=actor_is_root,
                     )
                     ui.notify(msg, type="positive" if ok else "negative")
                     if ok:
-                        # Si le Super-Admin connecté modifie son propre compte, on synchronise sa session
-                        if app_state.get("auth_user") and app_state["auth_user"]["id"] == uid:
-                            refreshed = get_user_by_username(in_uname.value or target_user["username"])
+                        cur_auth_u = app_state.get("auth_user")
+                        if cur_auth_u and int(cur_auth_u["id"]) == uid:
+                            refreshed = get_user_by_username(str(in_uname.value or target_user["username"]))
                             app_state["auth_user"] = refreshed
                             if refreshed:
                                 app_state["username"] = refreshed["username"]
@@ -412,29 +483,45 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                         user_dialog.close()
                         notify_all()
 
-                def do_delete_user(_e=None):
-                    conf = in_confirm_super.value if in_confirm_super is not None else ""
-                    ok, msg = delete_user_account(
-                        target_user_id=uid,
-                        confirm_super_pwd=conf or "",
-                        actor_username=actor_name,
+                def ask_delete_user(_e=None):
+                    conf = str(in_confirm_super.value or "") if in_confirm_super is not None else ""
+
+                    def really_del_user():
+                        ok, msg = delete_user_account(
+                            target_user_id=uid,
+                            confirm_super_pwd=conf,
+                            actor_username=actor_name,
+                            actor_is_root=actor_is_root,
+                        )
+                        ui.notify(msg, type="warning" if ok else "negative")
+                        if ok:
+                            cur_auth_u = app_state.get("auth_user")
+                            if cur_auth_u and int(cur_auth_u["id"]) == uid:
+                                app_state["auth_user"] = None
+                                app_state["username"] = ""
+                                app.storage.user["auth_username"] = ""
+                                ui.navigate.reload()
+                                return
+                            user_dialog.close()
+                            notify_all()
+
+                    open_confirm_action(
+                        f"Supprimer le compte « {target_user['username']} » ?",
+                        "Cette suppression est définitive et révoque immédiatement les accès associés.",
+                        "Supprimer le compte",
+                        really_del_user,
                     )
-                    ui.notify(msg, type="warning" if ok else "negative")
-                    if ok:
-                        if app_state.get("auth_user") and app_state["auth_user"]["id"] == uid:
-                            app_state["auth_user"] = None
-                            app_state["username"] = "chercheur"
-                            app.storage.user["auth_username"] = ""
-                        user_dialog.close()
-                        notify_all()
 
                 with ui.element("div").style("display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:14px;flex-wrap:wrap;"):
-                    _btn("Supprimer le compte", classes="glass-btn glass-btn-danger", on_click=do_delete_user)
+                    if not is_target_root:
+                        _btn("Supprimer le compte", classes="glass-btn glass-btn-danger", on_click=ask_delete_user)
+                    else:
+                        safe_html('<span class="muted-small">Compte fondateur protégé contre la suppression</span>')
                     _btn("Enregistrer", classes="glass-btn glass-btn-accent", style="padding:8px 18px;", on_click=do_save_user)
 
             user_dialog.open()
 
-        def open_resolve_reset_modal(req: dict, actor_name: str):
+        def open_resolve_reset_modal(req: dict[str, Any], actor_name: str):
             rid = int(req["id"])
             reset_pwd_body.clear()
             with reset_pwd_body:
@@ -446,11 +533,11 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
 
                 in_tmp = ui.input(
                     label="Nouveau mot de passe temporaire *",
-                    placeholder="Minimum 4 caractères",
+                    placeholder="Minimum 6 caractères",
                 ).props("outlined dense").style("width:100%;margin-bottom:14px;")
 
                 def apply_reset(_e=None):
-                    ok, msg = resolve_password_reset(rid, in_tmp.value or "", actor_name)
+                    ok, msg = resolve_password_reset(rid, str(in_tmp.value or ""), actor_name)
                     ui.notify(msg, type="positive" if ok else "negative")
                     if ok:
                         reset_pwd_dialog.close()
@@ -464,87 +551,27 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
 
         def refresh_admin():
             admin_root.clear()
-            # Rafraîchit toujours les infos utilisateur depuis SQLite (avertissements, rôle à jour)
             cur_auth = app_state.get("auth_user")
             if cur_auth:
-                fresh_u = get_user_by_username(cur_auth["username"])
-                if not fresh_u or fresh_u["role"] not in ("admin", "superadmin"):
-                    app_state["auth_user"] = None
-                    app_state["username"] = "chercheur"
-                    app.storage.user["auth_username"] = ""
-                    cur_auth = None
-                else:
+                fresh_u = get_user_by_username(str(cur_auth["username"]))
+                if fresh_u:
                     app_state["auth_user"] = fresh_u
                     cur_auth = fresh_u
 
+            if not cur_auth or cur_auth.get("role") not in ("admin", "superadmin"):
+                with admin_root:
+                    safe_html(
+                        '<div class="hud-card"><div class="section-kicker">ACCÈS RESTREINT</div>'
+                        '<h2>Espace réservé aux Administrateurs</h2>'
+                        '<p class="muted-text">Votre compte actuel ne dispose pas des droits de modération ou d\'administration.</p></div>'
+                    )
+                return
+
             with admin_root:
-                # --------------------------------------------------------------
-                # ÉCRAN DE CONNEXION + MOT DE PASSE OUBLIÉ
-                # --------------------------------------------------------------
-                if not cur_auth:
-                    with ui.element("div").classes("hud-card").style("max-width:460px;margin:20px auto;"):
-                        if not sub_state["forgot_mode"]:
-                            safe_html(
-                                '<div class="section-kicker">ACCÈS RESTREINT · GOUVERNANCE</div>'
-                                '<h2>Connexion Administrateur</h2>'
-                                '<p class="muted-text" style="margin-bottom:16px;">Identifiez-vous avec un compte Admin ou Super-Admin pour gérer la modération, les stocks critiques et la base.</p>'
-                            )
-                            in_user = ui.input(label="Identifiant").props("outlined dense").style("width:100%;margin-bottom:10px;")
-                            in_pwd = ui.input(label="Mot de passe", password=True, password_toggle_button=True).props("outlined dense").style("width:100%;margin-bottom:16px;")
-
-                            def try_login(_e=None):
-                                user = authenticate_user(in_user.value or "", in_pwd.value or "")
-                                if not user:
-                                    ui.notify("Identifiant ou mot de passe incorrect.", type="negative")
-                                    return
-                                if user["role"] not in ("admin", "superadmin"):
-                                    ui.notify("Ce compte (chercheur) n'a pas les droits d'administration.", type="warning")
-                                    return
-                                app_state["auth_user"] = user
-                                app_state["username"] = user["username"]
-                                app.storage.user["auth_username"] = user["username"]
-                                ui.notify(f"Connecté en tant que {user['username']} ({user['role']}).", type="positive")
-                                notify_all()
-
-                            in_pwd.on("keydown.enter", try_login)
-                            _btn("Se connecter", classes="glass-btn glass-btn-accent", style="width:100%;padding:10px;", on_click=try_login)
-
-                            with ui.element("div").style("text-align:center;margin-top:14px;"):
-                                _btn(
-                                    "Mot de passe oublié ?",
-                                    style="background:transparent;border:none;color:var(--cyan);font-size:0.80rem;",
-                                    on_click=lambda _e: (sub_state.update(forgot_mode=True), refresh_admin()),
-                                )
-                        else:
-                            safe_html(
-                                '<div class="section-kicker">RÉCUPÉRATION D\'ACCÈS</div>'
-                                '<h2>Mot de passe oublié</h2>'
-                                '<p class="muted-text" style="margin-bottom:16px;">Indiquez votre identifiant : une demande de réinitialisation sera transmise au Super-Admin.</p>'
-                            )
-                            in_forgot = ui.input(label="Votre identifiant").props("outlined dense").style("width:100%;margin-bottom:14px;")
-
-                            def send_reset(_e=None):
-                                ok, msg = request_password_reset(in_forgot.value or "")
-                                ui.notify(msg, type="positive" if ok else "negative")
-                                if ok:
-                                    sub_state["forgot_mode"] = False
-                                    notify_all()
-
-                            in_forgot.on("keydown.enter", send_reset)
-                            _btn("Envoyer la demande au Super-Admin", classes="glass-btn glass-btn-accent", style="width:100%;padding:10px;", on_click=send_reset)
-                            with ui.element("div").style("text-align:center;margin-top:12px;"):
-                                _btn(
-                                    "← Retour à la connexion",
-                                    style="background:transparent;border:none;color:var(--sub-txt);font-size:0.80rem;",
-                                    on_click=lambda _e: (sub_state.update(forgot_mode=False), refresh_admin()),
-                                )
-                    return
-
-                # --------------------------------------------------------------
-                # BANNIÈRE D'AVERTISSEMENT (SI VETO SUPER-ADMIN SUR CET ADMIN)
-                # --------------------------------------------------------------
                 is_super = cur_auth.get("role") == "superadmin"
-                adm_name = cur_auth["username"]
+                is_root = bool(cur_auth.get("is_root", False))
+                adm_name = str(cur_auth["username"])
+
                 if int(cur_auth.get("warnings") or 0) > 0 and int(cur_auth.get("warning_acknowledged") or 1) == 0:
                     with ui.element("div").classes("warning-banner"):
                         safe_html(
@@ -560,33 +587,24 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                             on_click=lambda _e: (acknowledge_user_warnings(adm_name), refresh_admin()),
                         )
 
-                # Cloisonnement strict : un admin ne peut jamais ouvrir audit ni users
-                if not is_super and sub_state["section"] in ("audit", "users"):
+                if not is_super and sub_state["section"] in ("activity", "audit", "users", "system"):
                     sub_state["section"] = "moderation"
 
                 pending_list = get_pending_syntheses()
                 unread_alerts = get_stock_alerts(unread_only=True)
                 pending_resets = get_pending_password_resets() if is_super else []
 
-                # Barre de session & sous-navigation
                 with ui.element("div").classes("hud-card").style("padding:14px 18px;margin-bottom:16px;"):
-                    with ui.element("div").style("display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;"):
-                        safe_html(
-                            f'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
-                            f'<span class="status-dot status-ok"></span>'
-                            f'<strong style="color:var(--txt);">Session : {html.escape(adm_name)}</strong>'
-                            f'<span class="mono-tag">{html.escape(cur_auth["role"].upper())}</span>'
-                            f'</div>'
-                        )
-
-                        def do_logout(_e=None):
-                            app_state["auth_user"] = None
-                            app_state["username"] = "chercheur"
-                            app.storage.user["auth_username"] = ""
-                            sub_state["section"] = "moderation"
-                            notify_all()
-
-                        _btn("Déconnexion", style="padding:5px 12px;", on_click=do_logout)
+                    root_pill = '<span class="root-badge">FONDATEUR · PLEINS POUVOIRS</span>' if is_root else ""
+                    safe_html(
+                        f'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+                        f'<span class="status-dot status-ok"></span>'
+                        f'<strong style="color:var(--txt);">Gouvernance : {html.escape(adm_name)}</strong>'
+                        f'<span class="mono-tag">{html.escape(str(cur_auth["role"]).upper())}</span>'
+                        f'{root_pill}'
+                        f'<span class="muted-small">PBKDF2-SHA256 actif</span>'
+                        f'</div>'
+                    )
 
                     sub_tabs = [
                         ("moderation", f"Modération ({len(pending_list)})"),
@@ -594,9 +612,11 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                         ("catalogue", "Édition Catalogue"),
                     ]
                     if is_super:
+                        sub_tabs.append(("activity", "Activité du Labo"))
                         sub_tabs.append(("audit", "Journal d'Audit & Veto"))
-                        u_lbl = f"Comptes & Rôles ({len(pending_resets)} MDP)" if pending_resets else "Comptes & Rôles"
+                        u_lbl = f"Comptes & Code Labo ({len(pending_resets)} MDP)" if pending_resets else "Comptes & Code Labo"
                         sub_tabs.append(("users", u_lbl))
+                        sub_tabs.append(("system", "Sauvegarde & Sync"))
 
                     with ui.element("div").style("display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"):
                         for s_key, s_lbl in sub_tabs:
@@ -608,7 +628,7 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                                 on_click=lambda _e, k=s_key: (sub_state.update(section=k), refresh_admin()),
                             )
 
-                sec = sub_state["section"]
+                sec = str(sub_state["section"])
 
                 # --- SECTION 1 : MODÉRATION ---
                 if sec == "moderation":
@@ -697,6 +717,19 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                             sid = int(r["id"])
                             p_name = clean_val(r.get("Produit final"))
                             cas = clean_val(r.get("Numéro CAS")) or "N/A"
+
+                            def ask_del_fiche(_e=None, i=sid, p=p_name):
+                                def do_del():
+                                    delete_synthese_by_id(i, adm_name)
+                                    ui.notify(f"Fiche « {p} » supprimée (réversible via Audit).", type="warning")
+                                    notify_all()
+                                open_confirm_action(
+                                    f"Supprimer la fiche « {p} » ?",
+                                    "Elle sera retirée du Catalogue (un Super-Admin pourra toujours la restaurer depuis le Journal d'Audit).",
+                                    "Supprimer la fiche",
+                                    do_del,
+                                )
+
                             with ui.element("div").classes("kv-item").style("display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:7px;flex-wrap:wrap;"):
                                 safe_html(
                                     f'<div><strong style="color:var(--txt);">{html.escape(p_name)}</strong> '
@@ -713,14 +746,60 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                                         "Supprimer",
                                         classes="glass-btn glass-btn-danger",
                                         style="padding:4px 10px;font-size:0.75rem;",
-                                        on_click=lambda _e, i=sid, p=p_name: (
-                                            delete_synthese_by_id(i, adm_name),
-                                            ui.notify(f"Fiche « {p} » supprimée (réversible via Audit).", type="warning"),
-                                            notify_all(),
-                                        ),
+                                        on_click=ask_del_fiche,
                                     )
 
-                # --- SECTION 4 : JOURNAL D'AUDIT & DROIT DE VETO (SUPER-ADMIN UNIQUEMENT) ---
+                # --- SECTION 4 : FIL D'ACTIVITÉ UNIFIÉ « QUI FAIT QUOI » (SUPER-ADMIN) ---
+                elif sec == "activity" and is_super:
+                    known_users = ["Tous"] + get_activity_usernames()
+                    if act_filters["user"] not in known_users:
+                        act_filters["user"] = "Tous"
+
+                    with ui.element("div").classes("hud-card"):
+                        safe_html(
+                            '<div class="section-kicker">SUPER-ADMIN · TRAÇABILITÉ GLOBALE</div>'
+                            '<h2>Activité du Laboratoire (Qui fait quoi ?)</h2>'
+                            '<p class="muted-small" style="margin-bottom:14px;">Connexions, inscriptions via Code Labo, prélèvements de stock, essais paillasse et propositions de fiches en temps réel.</p>'
+                        )
+                        with ui.element("div").style("display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:center;margin-bottom:14px;"):
+                            sel_u = ui.select(known_users, value=act_filters["user"], label="Filtrer par utilisateur").props("outlined dense")
+                            sel_c = ui.select(ACTIVITY_CATEGORIES, value=act_filters["cat"], label="Filtrer par catégorie").props("outlined dense")
+                            _btn("Actualiser", style="height:40px;", on_click=lambda _e: refresh_admin())
+
+                        sel_u.on_value_change(lambda e: (act_filters.update(user=str(e.value or "Tous")), refresh_admin()))
+                        sel_c.on_value_change(lambda e: (act_filters.update(cat=str(e.value or "Toutes")), refresh_admin()))
+
+                        acts = get_activity_logs(act_filters["user"], act_filters["cat"], limit=100)
+                        if not acts:
+                            safe_html('<p class="muted-text">Aucune activité enregistrée pour ces filtres.</p>')
+                        else:
+                            cat_styles = {
+                                "INSCRIPTION": "stock-ok",
+                                "CONNEXION": "stock-ok",
+                                "STOCK": "stock-low",
+                                "LABO": "stock-ok",
+                                "ADMIN": "stock-empty",
+                            }
+                            for ac in acts:
+                                cat = clean_val(ac.get("category")).upper()
+                                pill_cls = cat_styles.get(cat, "stock-ok")
+                                det = clean_val(ac.get("details"))
+                                det_html = f'<div class="muted-small" style="margin-top:3px;">{html.escape(det)}</div>' if det else ""
+                                safe_html(
+                                    f'<div class="kv-item" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:7px;flex-wrap:wrap;">'
+                                    f'<div style="flex:1;min-width:240px;">'
+                                    f'<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;">'
+                                    f'<span class="stock-pill {pill_cls}">{html.escape(cat)}</span>'
+                                    f'<strong style="color:var(--txt);font-size:0.88rem;">{html.escape(clean_val(ac.get("action")))}</strong>'
+                                    f'</div>{det_html}</div>'
+                                    f'<div style="text-align:right;font-family:\'JetBrains Mono\',monospace;">'
+                                    f'<div style="color:var(--cyan);font-size:0.80rem;font-weight:600;">{html.escape(clean_val(ac.get("username")))} '
+                                    f'<span class="muted-small">({html.escape(clean_val(ac.get("role")))})</span></div>'
+                                    f'<div class="muted-small">{html.escape(clean_val(ac.get("timestamp")))}</div>'
+                                    f'</div></div>'
+                                )
+
+                # --- SECTION 5 : JOURNAL D'AUDIT & VETO (SUPER-ADMIN UNIQUEMENT) ---
                 elif sec == "audit" and is_super:
                     logs = get_audit_logs()
                     with ui.element("div").classes("hud-card"):
@@ -772,11 +851,34 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
                                                         on_click=lambda _e, i=lid: do_veto(i, True),
                                                     )
 
-                # --- SECTION 5 : COMPTES, RÔLES & MOTS DE PASSE OUBLIÉS (SUPER-ADMIN UNIQUEMENT) ---
+                # --- SECTION 6 : COMPTES, HIÉRARCHIE & CODE LABORATOIRE (SUPER-ADMIN) ---
                 elif sec == "users" and is_super:
                     users = get_all_users()
+                    reg_cfg = get_lab_registration_settings()
 
-                    # Demandes de réinitialisation mot de passe
+                    # Carte Option A : Code Laboratoire rotatif + interrupteur On/Off
+                    with ui.element("div").classes("hud-card").style("margin-bottom:16px;border-left:3px solid var(--cyan);"):
+                        safe_html(
+                            '<div class="section-kicker">INSCRIPTION AUTONOME SÉCURISÉE (OPTION A)</div>'
+                            '<h2>Code d\'Accès Laboratoire</h2>'
+                            '<p class="muted-small" style="margin-bottom:12px;">Toute personne connaissant ce code peut créer son compte <strong>chercheur</strong> sans validation manuelle. Modifiez-le à tout moment ou fermez les inscriptions en 1 clic.</p>'
+                        )
+                        with ui.element("div").style("display:grid;grid-template-columns:1.4fr auto auto;gap:12px;align-items:center;"):
+                            in_lab_code = ui.input(label="Code Laboratoire actif", value=str(reg_cfg["code"])).props("outlined dense")
+                            sw_reg_open = ui.switch("Inscriptions ouvertes", value=bool(reg_cfg["open"]))
+
+                            def save_reg_cfg(_e=None):
+                                ok, msg = update_lab_registration_settings(
+                                    str(in_lab_code.value or ""),
+                                    bool(sw_reg_open.value),
+                                    actor_username=adm_name,
+                                )
+                                ui.notify(msg, type="positive" if ok else "negative")
+                                if ok:
+                                    refresh_admin()
+
+                            _btn("Enregistrer le code", classes="glass-btn glass-btn-accent", style="height:40px;", on_click=save_reg_cfg)
+
                     if pending_resets:
                         with ui.element("div").classes("hud-card").style("margin-bottom:16px;border-left:3px solid var(--warn);"):
                             safe_html(
@@ -805,44 +907,108 @@ def build_analytics_and_admin_views(app_state: dict, on_data_changed=None):
 
                     with ui.element("div").classes("modal-grid"):
                         with ui.element("div").classes("hud-card"):
+                            rule_hint = (
+                                "En tant que Super-Admin Fondateur, vous pouvez modifier/supprimer n'importe quel compte sans mot de passe."
+                                if is_root
+                                else "Le Super-Admin Fondateur est intouchable. Toute action sur un autre Super-Admin exige son mot de passe."
+                            )
                             safe_html(
                                 '<div class="section-kicker">SUPER-ADMIN · HIÉRARCHIE</div>'
-                                '<h2>Comptes existants</h2>'
-                                '<p class="muted-small" style="margin-bottom:12px;">Modifier, rétrograder ou supprimer un compte. Toute action sur un Super-Admin exige son mot de passe.</p>'
+                                f'<h2>Comptes existants ({len(users)})</h2>'
+                                f'<p class="muted-small" style="margin-bottom:12px;">{html.escape(rule_hint)}</p>'
                             )
                             for u in users:
+                                u_is_root = bool(u.get("is_root", False))
                                 w_cnt = int(u.get("warnings") or 0)
                                 w_tag = f'<span class="stock-pill stock-low">{w_cnt} avert.</span>' if w_cnt > 0 else ""
+                                root_tag = '<span class="root-badge">FONDATEUR</span>' if u_is_root else ""
                                 with ui.element("div").classes("kv-item").style("display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;"):
                                     safe_html(
                                         f'<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;">'
                                         f'<strong style="color:var(--txt);">{html.escape(u["username"])}</strong>'
-                                        f'<span class="mono-tag">{html.escape(u["role"].upper())}</span>{w_tag}</div>'
+                                        f'<span class="mono-tag">{html.escape(u["role"].upper())}</span>{root_tag}{w_tag}</div>'
                                     )
-                                    _btn(
-                                        "Gérer / Rétrograder",
-                                        style="padding:4px 11px;font-size:0.75rem;",
-                                        on_click=lambda _e, usr=u: open_user_manage_modal(usr, adm_name),
-                                    )
+                                    if u_is_root and not is_root:
+                                        safe_html('<span class="muted-small">Protégé</span>')
+                                    else:
+                                        _btn(
+                                            "Gérer / Rétrograder",
+                                            style="padding:4px 11px;font-size:0.75rem;",
+                                            on_click=lambda _e, usr=u: open_user_manage_modal(usr, adm_name, is_root),
+                                        )
 
                         with ui.element("div").classes("hud-card"):
-                            safe_html('<div class="section-kicker">NOUVEL ACCÈS</div><h2>Créer un compte</h2>')
+                            safe_html('<div class="section-kicker">NOUVEL ACCÈS</div><h2>Créer un compte manuellement</h2>')
                             new_u = ui.input(label="Identifiant").props("outlined dense").style("width:100%;margin-bottom:10px;")
-                            new_p = ui.input(label="Mot de passe", password=True, password_toggle_button=True).props("outlined dense").style("width:100%;margin-bottom:10px;")
-                            new_r = ui.select(["admin", "superadmin", "chercheur"], value="admin", label="Rôle").props("outlined dense").style("width:100%;margin-bottom:14px;")
+                            new_p = ui.input(label="Mot de passe (min. 6 car.)", password=True, password_toggle_button=True).props("outlined dense").style("width:100%;margin-bottom:10px;")
+                            new_r = ui.select(["chercheur", "admin", "superadmin"], value="chercheur", label="Rôle").props("outlined dense").style("width:100%;margin-bottom:14px;")
 
                             def do_create(_e=None):
-                                if not clean_val(new_u.value) or not clean_val(new_p.value):
-                                    ui.notify("Remplissez l'identifiant et le mot de passe.", type="warning")
+                                u_val = clean_val(new_u.value)
+                                p_val = str(new_p.value or "")
+                                if not u_val or len(p_val) < 6:
+                                    ui.notify("Indiquez un identifiant et un mot de passe d'au moins 6 caractères.", type="warning")
                                     return
-                                ok = create_user(new_u.value, new_p.value, new_r.value or "admin")
+                                ok = create_user(u_val, p_val, str(new_r.value or "chercheur"), actor_username=adm_name)
                                 if ok:
-                                    ui.notify(f"Compte « {new_u.value} » ({new_r.value}) créé.", type="positive")
+                                    ui.notify(f"Compte « {u_val} » ({new_r.value}) créé.", type="positive")
                                     refresh_admin()
                                 else:
                                     ui.notify("Cet identifiant existe déjà.", type="negative")
 
                             _btn("Créer le compte", classes="glass-btn glass-btn-accent", on_click=do_create)
+
+                # --- SECTION 7 : SAUVEGARDE SQLITE & SYNCHRO GITHUB (SUPER-ADMIN UNIQUEMENT) ---
+                elif sec == "system" and is_super:
+                    gh = get_github_sync_status()
+                    db_bytes = get_db_backup_bytes()
+                    size_kb = len(db_bytes) / 1024.0
+                    sync_dot = "status-ok" if gh["last_ok"] is True else ("status-err" if gh["last_ok"] is False else "status-warn")
+
+                    with ui.element("div").classes("modal-grid"):
+                        with ui.element("div").classes("hud-card"):
+                            safe_html(
+                                '<div class="section-kicker">ARCHIVE COMPLÈTE</div>'
+                                '<h2>Sauvegarde Locale SQLite</h2>'
+                                f'<p class="muted-text" style="margin-bottom:14px;">Téléchargez une copie instantanée de <code>chimie_db.sqlite</code> ({size_kb:.1f} Ko) contenant le catalogue, l\'inventaire, les mouvements, le Cahier de Laboratoire, les comptes hachés et les journaux.</p>'
+                            )
+
+                            def download_backup(_e=None):
+                                raw = get_db_backup_bytes()
+                                if not raw:
+                                    ui.notify("Fichier chimie_db.sqlite introuvable.", type="negative")
+                                    return
+                                stamp = datetime.now().strftime("%Y%m%d_%H%M")
+                                ui.download(raw, f"chimie_db_backup_{stamp}.sqlite")
+
+                            _btn(
+                                "Télécharger chimie_db.sqlite",
+                                classes="glass-btn glass-btn-accent",
+                                style="padding:10px 18px;",
+                                on_click=download_backup,
+                            )
+
+                        with ui.element("div").classes("hud-card"):
+                            safe_html(
+                                '<div class="section-kicker">PERSISTANCE CLOUD (RENDER)</div>'
+                                '<h2>Synchronisation GitHub</h2>'
+                                f'<div class="kv-grid" style="margin-bottom:12px;">'
+                                f'<div class="kv-item"><div class="kv-label">Configuration</div><div class="kv-val">{"Active (" + html.escape(gh["repo"]) + ")" if gh["configured"] else "Mode local"}</div></div>'
+                                f'<div class="kv-item"><div class="kv-label">Dernière synchro</div><div class="kv-val">{html.escape(gh["last_sync"])}</div></div>'
+                                f'</div>'
+                                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;">'
+                                f'<span class="status-dot {sync_dot}"></span>'
+                                f'<span class="muted-small">{html.escape(gh["message"])}</span></div>'
+                            )
+                            if gh["configured"]:
+                                async def force_sync(_e=None):
+                                    ui.notify("Synchronisation vers GitHub en cours...", type="info")
+                                    await run.io_bound(sync_db_to_github)
+                                    st_now = get_github_sync_status()
+                                    ui.notify(st_now["message"], type="positive" if st_now["last_ok"] else "negative")
+                                    refresh_admin()
+
+                                _btn("Forcer une synchronisation maintenant", on_click=force_sync)
 
         refresh_admin()
         return refresh_admin

@@ -1,11 +1,15 @@
 import html
+import urllib.parse
 from nicegui import ui
+from typing import Any
 
 from chem_data import clean_val, export_styled_table, get_known_density
 from database import (
     adjust_inventory_quantity,
     delete_inventory_item,
     get_all_inventory,
+    get_all_syntheses,
+    get_stock_movements,
     quick_stock_movement,
     upsert_inventory_item,
 )
@@ -44,19 +48,107 @@ def _convert_g_ml(qty: float, unite: str, densite: float) -> str:
     return "—"
 
 
-def build_stocks_view(on_data_changed=None):
+def build_stocks_view(app_state: dict, on_data_changed=None):
     edit_dialog = ui.dialog().props('transition-show="fade" transition-hide="fade"')
     with edit_dialog:
         edit_body = ui.element("div").classes("cb-inspector-card")
 
+    history_dialog = ui.dialog().props('transition-show="fade" transition-hide="fade"')
+    with history_dialog:
+        history_body = ui.element("div").classes("cb-inspector-card")
+
+    confirm_dialog = ui.dialog().props('transition-show="fade" transition-hide="fade"')
+    with confirm_dialog:
+        confirm_body = ui.element("div").classes("cb-confirm-card")
+
     focus_hook = {"set_search": None}
+
+    def current_op() -> str:
+        return app_state.get("username", "chercheur")
+
+    def open_confirm_delete(label_name: str, on_confirm):
+        confirm_body.clear()
+        with confirm_body:
+            safe_html(
+                '<div class="section-kicker" style="color:var(--danger);">CONFIRMATION REQUISE</div>'
+                f'<h2 style="margin:6px 0 8px 0;font-size:1.2rem;">Supprimer « {html.escape(label_name)} » ?</h2>'
+                '<p class="muted-text" style="margin-bottom:18px;">Cette référence sera retirée définitivement de l\'inventaire physique.</p>'
+            )
+            with ui.element("div").style("display:flex;justify-content:flex-end;gap:10px;"):
+                _btn("Annuler", on_click=lambda _e: confirm_dialog.close())
+                _btn(
+                    "Confirmer la suppression",
+                    classes="glass-btn glass-btn-danger",
+                    on_click=lambda _e: (confirm_dialog.close(), on_confirm()),
+                )
+        confirm_dialog.open()
+
+    def build_label_url_for_item(item: dict) -> str:
+        nom = clean_val(item.get("nom_substance"))
+        syn_match = next(
+            (r for r in get_all_syntheses() if clean_val(r.get("Produit final")).lower() == nom.lower()),
+            {},
+        )
+        return (
+            f"/api/label?nom={urllib.parse.quote(nom)}"
+            f"&cas={urllib.parse.quote(clean_val(syn_match.get('Numéro CAS')))}"
+            f"&formule={urllib.parse.quote(clean_val(syn_match.get('Formule brute & masse')))}"
+            f"&pictos={urllib.parse.quote(clean_val(syn_match.get('Pictogrammes danger')))}"
+            f"&stockage={urllib.parse.quote(clean_val(item.get('emplacement')) or clean_val(syn_match.get('Conditions de stockage')))}"
+            f"&op={urllib.parse.quote(current_op())}"
+        )
+
+    def open_movements_modal(item: dict):
+        nom = clean_val(item.get("nom_substance"))
+        unit = clean_val(item.get("unite")) or "g"
+        qty = float(item.get("quantite") or 0.0)
+        dens = float(item.get("densite") or 1.0)
+        moves = get_stock_movements(nom, limit=40)
+        label_url = build_label_url_for_item(item)
+
+        history_body.clear()
+        with history_body:
+            with ui.element("div").classes("modal-head"):
+                with ui.element("div"):
+                    safe_html('<div class="section-kicker">TRAÇABILITÉ INVENTAIRE · JOURNAL DES MOUVEMENTS</div>')
+                    safe_html(
+                        f'<h2 style="margin:4px 0 4px 0;font-size:1.3rem;">{html.escape(nom)}</h2>'
+                        f'<div class="muted-small">Stock actuel : <strong style="color:var(--cyan);">{qty:g} {html.escape(unit)}</strong> '
+                        f'({_convert_g_ml(qty, unit, dens)}) · Emplacement : {html.escape(clean_val(item.get("emplacement")) or "N/A")}</div>'
+                    )
+                with ui.element("div").style("display:flex;gap:8px;flex-wrap:wrap;"):
+                    safe_html(f'<a class="glass-btn" style="text-decoration:none;" href="{label_url}" target="_blank">Étiquette flacon</a>')
+                    _btn("Fermer ✕", on_click=lambda _e: history_dialog.close())
+
+            if not moves:
+                safe_html(
+                    '<div class="detail-box"><p class="muted-text">Aucun mouvement encore enregistré pour cette substance. '
+                    'Les prochains prélèvements, réapprovisionnements et déductions du calculateur apparaîtront ici.</p></div>'
+                )
+            else:
+                rows_html = []
+                for mv in moves:
+                    d_val = float(mv.get("delta") or 0.0)
+                    sign_cls = "stock-ok" if d_val >= 0 else "stock-empty"
+                    sign_txt = f"+{d_val:g}" if d_val >= 0 else f"{d_val:g}"
+                    u_mv = clean_val(mv.get("unite")) or unit
+                    rows_html.append(
+                        f'<div class="kv-item" style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:7px;flex-wrap:wrap;">'
+                        f'<div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap;">'
+                        f'<span class="stock-pill {sign_cls}">{sign_txt} {html.escape(u_mv)}</span>'
+                        f'<div><strong style="color:var(--txt);font-size:0.86rem;">{html.escape(clean_val(mv.get("motif")))}</strong>'
+                        f'<div class="muted-small">Par {html.escape(clean_val(mv.get("operateur")))} · {html.escape(clean_val(mv.get("timestamp")))}</div></div>'
+                        f'</div>'
+                        f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:0.84rem;color:var(--cyan);">'
+                        f'Solde : {float(mv.get("quantite_apres") or 0.0):g} {html.escape(u_mv)}</div></div>'
+                    )
+                safe_html("".join(rows_html))
+
+        history_dialog.open()
 
     def render_stocks_tab():
         filters = {"q": "", "cat": "Toutes", "low_only": False}
 
-        # ------------------------------------------------------------------
-        # 1. BLOC MOUVEMENT RAPIDE DE PAILLASSE (FIXE EN HAUT)
-        # ------------------------------------------------------------------
         all_init = get_all_inventory()
         sub_names = [it["nom_substance"] for it in all_init]
 
@@ -65,7 +157,7 @@ def build_stocks_view(on_data_changed=None):
                 '<div class="section-kicker">MOUVEMENT RAPIDE DE PAILLASSE</div>'
                 '<div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;margin-bottom:12px;">'
                 '<h2 style="margin:2px 0 0 0;">Prélever ou Réapprovisionner en un geste</h2>'
-                '<span class="muted-small">Conversion automatique g ↔ mL selon la densité enregistrée</span></div>'
+                '<span class="muted-small">Conversion automatique g ↔ mL et journalisation par substance</span></div>'
             )
             with ui.element("div").style("display:grid;grid-template-columns:2fr 0.9fr 0.7fr auto auto;gap:10px;align-items:center;"):
                 qm_sub = ui.select(
@@ -81,9 +173,6 @@ def build_stocks_view(on_data_changed=None):
 
             qm_info_slot = ui.element("div").style("margin-top:8px;")
 
-        # ------------------------------------------------------------------
-        # 2. BARRE DE FILTRES & ACTIONS TABLEAU
-        # ------------------------------------------------------------------
         with ui.element("div").style("display:grid;grid-template-columns:2fr 1.2fr auto auto auto;gap:10px;align-items:center;margin-bottom:12px;"):
             q_in = ui.input(placeholder="Filtrer le tableau par substance ou emplacement...").props("outlined dense clearable")
             cat_sel = ui.select(["Toutes"] + CATEGORIES, value="Toutes", label="Catégorie").props("outlined dense")
@@ -121,7 +210,7 @@ def build_stocks_view(on_data_changed=None):
             if not sel or amt <= 0:
                 ui.notify("Choisissez une substance et une quantité positive.", type="warning")
                 return
-            ok, msg = quick_stock_movement(sel, amt, qm_unit.value or "g", is_addition=is_add)
+            ok, msg = quick_stock_movement(sel, amt, qm_unit.value or "g", is_addition=is_add, operator=current_op())
             ui.notify(msg, type="positive" if ok else "negative")
             notify_refresh()
 
@@ -195,21 +284,29 @@ def build_stocks_view(on_data_changed=None):
                         seuil=float(in_seuil.value or 0.0),
                         emplacement=in_loc.value or "Armoire",
                         densite=float(in_dens.value or 1.0),
-                        item_id=item["id"] if is_edit else None,
+                        item_id=item["id"] if item is not None else None,
+                        operator=current_op(),
                     )
                     edit_dialog.close()
                     ui.notify(f"Inventaire mis à jour pour « {nom_v} ».", type="positive")
                     notify_refresh()
 
-                def on_delete(_e=None):
-                    delete_inventory_item(item["id"])
-                    edit_dialog.close()
-                    ui.notify(f"Référence « {item['nom_substance']} » supprimée.", type="warning")
-                    notify_refresh()
+                def ask_delete(_e=None):
+                    if item is None:
+                        return
+                    target_id = item["id"]
+                    target_nom = item["nom_substance"]
+
+                    def really_delete():
+                        delete_inventory_item(target_id, operator=current_op())
+                        edit_dialog.close()
+                        ui.notify(f"Référence « {target_nom} » supprimée.", type="warning")
+                        notify_refresh()
+                    open_confirm_delete(target_nom, really_delete)
 
                 with ui.element("div").style("display:flex;justify-content:space-between;align-items:center;margin-top:18px;gap:10px;"):
                     if is_edit:
-                        _btn("Supprimer", classes="glass-btn glass-btn-danger", on_click=on_delete)
+                        _btn("Supprimer", classes="glass-btn glass-btn-danger", on_click=ask_delete)
                     else:
                         ui.element("div")
                     _btn("Enregistrer", classes="glass-btn glass-btn-accent", style="padding:9px 20px;", on_click=on_save)
@@ -270,7 +367,7 @@ def build_stocks_view(on_data_changed=None):
 
             summary_slot.clear()
             with summary_slot:
-                safe_html(f"<span>{len(items)} RÉFÉRENCE(S) · {low_count} EN ALERTE CRITIQUE / RUPTURE</span>")
+                safe_html(f"<span>{len(items)} RÉFÉRENCE(S) · {low_count} EN ALERTE CRITIQUE / RUPTURE · CLIC SUR « HISTORIQUE » POUR LA TRAÇABILITÉ</span>")
                 _btn(
                     "Export Inventaire complet (.xls)",
                     style="padding:4px 10px;font-size:0.72rem;",
@@ -320,7 +417,6 @@ def build_stocks_view(on_data_changed=None):
                         dens = float(it.get("densite") or 1.0)
                         equiv = _convert_g_ml(qty, unit, dens)
 
-                        # Calcul du pourcentage pour la jauge visuelle
                         ref_max = max(seuil * 3.0, qty, 1.0)
                         pct = min(100.0, max(4.0 if qty > 0 else 0.0, (qty / ref_max) * 100.0))
 
@@ -337,7 +433,6 @@ def build_stocks_view(on_data_changed=None):
                         step = 10.0 if seuil >= 20 else 5.0
 
                         with ui.element("div").classes("stock-table-row"):
-                            # Col 1 : Substance
                             safe_html(
                                 f'<div>'
                                 f'<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;">'
@@ -345,14 +440,12 @@ def build_stocks_view(on_data_changed=None):
                                 f'<div class="muted-small" style="margin-top:2px;">{html.escape(clean_val(it.get("categorie")))} · d={dens:.2f}</div>'
                                 f'</div>'
                             )
-                            # Col 2 : Quantité & conversion
                             safe_html(
                                 f'<div style="font-family:\'JetBrains Mono\',monospace;">'
                                 f'<div style="font-size:0.95rem;font-weight:700;color:var(--txt);">{qty:g} {html.escape(unit)}</div>'
                                 f'<div class="muted-small" style="color:var(--cyan);">{html.escape(equiv)}</div>'
                                 f'</div>'
                             )
-                            # Col 3 : Jauge visuelle
                             safe_html(
                                 f'<div>'
                                 f'<div class="muted-small" style="display:flex;justify-content:space-between;">'
@@ -360,24 +453,27 @@ def build_stocks_view(on_data_changed=None):
                                 f'<div class="gauge-track"><div class="{gauge_cls}" style="width:{pct:.1f}%;"></div></div>'
                                 f'</div>'
                             )
-                            # Col 4 : Emplacement
                             safe_html(f'<div class="muted-small" style="color:var(--txt);">{html.escape(clean_val(it.get("emplacement")) or "N/A")}</div>')
 
-                            # Col 5 : Boutons rapides
-                            with ui.element("div").style("display:flex;align-items:center;justify-content:flex-end;gap:5px;"):
+                            with ui.element("div").style("display:flex;align-items:center;justify-content:flex-end;gap:5px;flex-wrap:wrap;"):
                                 _btn(
                                     f"-{step:g}",
-                                    style="padding:4px 9px;font-size:0.75rem;font-family:'JetBrains Mono',monospace;",
-                                    on_click=lambda _e, i=it_id, d=-step: (adjust_inventory_quantity(i, d), notify_refresh()),
+                                    style="padding:4px 8px;font-size:0.74rem;font-family:'JetBrains Mono',monospace;",
+                                    on_click=lambda _e, i=it_id, d=-step: (adjust_inventory_quantity(i, d, operator=current_op()), notify_refresh()),
                                 )
                                 _btn(
                                     f"+{step:g}",
-                                    style="padding:4px 9px;font-size:0.75rem;font-family:'JetBrains Mono',monospace;",
-                                    on_click=lambda _e, i=it_id, d=step: (adjust_inventory_quantity(i, d), notify_refresh()),
+                                    style="padding:4px 8px;font-size:0.74rem;font-family:'JetBrains Mono',monospace;",
+                                    on_click=lambda _e, i=it_id, d=step: (adjust_inventory_quantity(i, d, operator=current_op()), notify_refresh()),
+                                )
+                                _btn(
+                                    "Historique",
+                                    style="padding:4px 9px;font-size:0.74rem;",
+                                    on_click=lambda _e, row=it: open_movements_modal(row),
                                 )
                                 _btn(
                                     "Éditer",
-                                    style="padding:4px 10px;font-size:0.75rem;",
+                                    style="padding:4px 9px;font-size:0.74rem;",
                                     on_click=lambda _e, row=it: open_edit_modal(row),
                                 )
 
@@ -386,7 +482,7 @@ def build_stocks_view(on_data_changed=None):
             filters["q"] = term
             refresh_table()
 
-        focus_hook["set_search"] = set_search
+        focus_hook: dict[str, Any] = {"set_search": None}
 
         q_in.on_value_change(lambda e: (filters.update(q=e.value or ""), refresh_table()))
         cat_sel.on_value_change(lambda e: (filters.update(cat=e.value or "Toutes"), refresh_table()))

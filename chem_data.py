@@ -703,11 +703,10 @@ def build_3dmol_html(cas_str: str, dark_mode: bool = True) -> str:
 </script></body></html>"""
 
 
-def render_pictograms_html(picto_str: str) -> str:
-    """Pictogrammes SGH vectoriels SVG intégrés directement dans le code (zéro dépendance PNG)."""
+def extract_sgh_codes(picto_str: str) -> list:
     raw = clean_val(picto_str)
     if not raw:
-        return '<span class="muted-small">Aucun danger majeur classé</span>'
+        return []
     valid = []
     seen = set()
     for c in [x.strip().upper() for x in raw.split(",") if x.strip()]:
@@ -716,6 +715,14 @@ def render_pictograms_html(picto_str: str) -> str:
                 seen.add(k)
                 valid.append((k, lbl))
                 break
+    return valid
+
+
+def render_pictograms_html(picto_str: str) -> str:
+    raw = clean_val(picto_str)
+    if not raw:
+        return '<span class="muted-small">Aucun danger majeur classé</span>'
+    valid = extract_sgh_codes(raw)
     if not valid:
         return f'<span class="mono-tag">{html.escape(raw)}</span>'
     items = []
@@ -727,6 +734,164 @@ def render_pictograms_html(picto_str: str) -> str:
             f"<span>{code}</span></div>"
         )
     return f'<div class="sgh-row">{"".join(items)}</div>'
+
+
+def generate_bottle_label_html(
+    nom: str,
+    cas: str = "",
+    formule: str = "",
+    pictos: str = "",
+    stockage: str = "",
+    operateur: str = "chercheur",
+    date_str: str = "",
+    lot_info: str = "",
+) -> str:
+    """Page prête à imprimer avec étiquette de flacon normée SGH (et repères de découpe)."""
+    nom_s = html.escape(clean_val(nom) or "Substance")
+    cas_s = html.escape(clean_val(cas) or "Non renseigné")
+    form_s = html.escape(clean_val(formule) or "—")
+    stock_s = html.escape(clean_val(stockage) or "Température ambiante, au sec")
+    op_s = html.escape(clean_val(operateur) or "chercheur")
+    dt_s = html.escape(clean_val(date_str) or datetime.now().strftime("%d/%m/%Y"))
+    lot_s = html.escape(clean_val(lot_info) or f"CB-{datetime.now().strftime('%y%m%d')}")
+
+    valid_sgh = extract_sgh_codes(pictos)
+    if valid_sgh:
+        sgh_block = "".join([
+            f'<div class="picto-box">{SGH_SVG_MAP[c]}<span>{c} · {html.escape(lbl)}</span></div>'
+            for c, lbl in valid_sgh
+        ])
+        signal_word = (
+            "DANGER"
+            if any(c in ("SGH01", "SGH02", "SGH05", "SGH06", "SGH08") for c, _ in valid_sgh)
+            else "ATTENTION"
+        )
+        signal_cls = "sig-danger" if signal_word == "DANGER" else "sig-warn"
+    else:
+        sgh_block = '<div class="no-sgh">Aucun pictogramme SGH majeur classé</div>'
+        signal_word = "USAGE LABO"
+        signal_cls = "sig-safe"
+
+    return f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"><title>Étiquette Flacon — {nom_s}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #eef2f3; margin: 0; padding: 28px; color: #0f172a; }}
+  .toolbar {{ max-width: 110mm; margin: 0 auto 18px auto; display: flex; justify-content: space-between; align-items: center; gap: 10px; }}
+  .print-btn {{ background: #059669; color: #fff; border: none; border-radius: 8px; padding: 9px 16px; font-weight: 700; cursor: pointer; font-size: 13px; }}
+  .print-btn:hover {{ background: #047857; }}
+  .hint {{ font-size: 12px; color: #475569; }}
+  .sheet {{ display: flex; flex-direction: column; gap: 10mm; align-items: center; }}
+  .label-card {{
+    width: 105mm; min-height: 62mm; background: #ffffff;
+    border: 1.5px dashed #94a3b8; padding: 4.5mm 5.5mm;
+    display: flex; flex-direction: column; justify-content: space-between;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.08);
+  }}
+  .top-row {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; border-bottom: 1.6px solid #0f172a; padding-bottom: 3mm; }}
+  .brand {{ font-family: Consolas, monospace; font-size: 8.5px; letter-spacing: 0.1em; color: #059669; font-weight: 700; }}
+  .title {{ font-size: 16px; font-weight: 800; margin: 2px 0 1px 0; line-height: 1.15; }}
+  .sub {{ font-family: Consolas, monospace; font-size: 10px; color: #334155; }}
+  .sig {{ font-family: Consolas, monospace; font-size: 10px; font-weight: 800; padding: 3px 7px; border-radius: 4px; letter-spacing: 0.08em; }}
+  .sig-danger {{ background: #dc2626; color: #fff; }}
+  .sig-warn {{ background: #d97706; color: #fff; }}
+  .sig-safe {{ background: #059669; color: #fff; }}
+  .pictos {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 3mm 0; }}
+  .picto-box {{ display: inline-flex; flex-direction: column; align-items: center; gap: 2px; }}
+  .picto-box svg {{ width: 34px; height: 34px; }}
+  .picto-box span {{ font-size: 7.5px; font-family: Consolas, monospace; color: #334155; }}
+  .no-sgh {{ font-size: 10px; color: #475569; font-style: italic; }}
+  .meta {{ border-top: 1px solid #cbd5e1; padding-top: 2.5mm; font-size: 9.5px; line-height: 1.45; }}
+  .meta-row {{ display: flex; justify-content: space-between; gap: 8px; font-family: Consolas, monospace; font-size: 8.8px; color: #334155; margin-top: 3px; }}
+  @media print {{
+    body {{ background: #fff; padding: 4mm; }}
+    .toolbar {{ display: none !important; }}
+    .label-card {{ box-shadow: none; break-inside: avoid; }}
+  }}
+</style></head>
+<body>
+  <div class="toolbar">
+    <span class="hint">Format 105 × 62 mm · Repères de découpe inclus</span>
+    <button class="print-btn" onclick="window.print()">Imprimer / Enregistrer en PDF</button>
+  </div>
+  <div class="sheet">
+    <div class="label-card">
+      <div class="top-row">
+        <div>
+          <div class="brand">CHEMBASE R&amp;D · ÉTIQUETTE FLACON</div>
+          <div class="title">{nom_s}</div>
+          <div class="sub">CAS : {cas_s} · {form_s}</div>
+        </div>
+        <span class="sig {signal_cls}">{signal_word}</span>
+      </div>
+      <div class="pictos">{sgh_block}</div>
+      <div class="meta">
+        <div><strong>Stockage :</strong> {stock_s}</div>
+        <div class="meta-row">
+          <span>Lot : {lot_s}</span>
+          <span>Opérateur : {op_s}</span>
+          <span>Date : {dt_s}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</body></html>"""
+
+
+def generate_labo_entry_html(entry: dict) -> str:
+    """Fiche de paillasse imprimable / PDF pour un essai du Cahier de Laboratoire."""
+    prod = html.escape(clean_val(entry.get("produit_cible")) or "Essai")
+    dt = html.escape(clean_val(entry.get("date_essai")) or "N/A")
+    op = html.escape(clean_val(entry.get("operateur")) or "chercheur")
+    st = html.escape(clean_val(entry.get("statut")) or "N/A")
+    qtes = html.escape(clean_val(entry.get("quantites_engagees")) or "Non précisé")
+    mt = float(entry.get("masse_theorique") or 0.0)
+    mo = float(entry.get("masse_obtenue") or 0.0)
+    rdt = float(entry.get("rendement_reel") or 0.0)
+    rdt_ref = html.escape(clean_val(entry.get("rendement_theorique")) or "N/A")
+    obs = html.escape(clean_val(entry.get("observations")) or "Aucune observation complémentaire.")
+    eid = entry.get("id", "—")
+
+    return f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"><title>Essai #{eid} — {prod}</title>
+<style>
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 36px; color: #0f172a; background: #f4f7f6; }}
+  .toolbar {{ max-width: 780px; margin: 0 auto 14px auto; text-align: right; }}
+  .print-btn {{ background: #059669; color: #fff; border: none; border-radius: 8px; padding: 9px 16px; font-weight: 700; cursor: pointer; }}
+  .sheet {{ max-width: 780px; margin: 0 auto; background: #fff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 34px; }}
+  h1 {{ color: #059669; font-size: 1.15rem; letter-spacing: 0.06em; text-transform: uppercase; border-bottom: 2px solid #059669; padding-bottom: 8px; margin: 0 0 12px 0; }}
+  h2 {{ margin: 0 0 16px 0; font-size: 1.5rem; }}
+  .grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 18px; }}
+  .box {{ background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px 12px; }}
+  .lbl {{ font-family: Consolas, monospace; font-size: 10px; text-transform: uppercase; color: #64748b; }}
+  .val {{ font-size: 15px; font-weight: 700; margin-top: 3px; }}
+  .sec {{ background: #f8fafc; border-left: 3px solid #059669; padding: 14px 16px; border-radius: 6px; margin-bottom: 14px; }}
+  .sec h3 {{ margin: 0 0 6px 0; font-size: 0.9rem; color: #059669; text-transform: uppercase; font-family: Consolas, monospace; }}
+  .foot {{ margin-top: 28px; padding-top: 10px; border-top: 1px solid #e2e8f0; font-family: Consolas, monospace; font-size: 11px; color: #64748b; display: flex; justify-content: space-between; }}
+  @media print {{
+    body {{ background: #fff; margin: 0; }}
+    .toolbar {{ display: none !important; }}
+    .sheet {{ border: none; padding: 10mm; max-width: 100%; }}
+  }}
+</style></head>
+<body>
+  <div class="toolbar"><button class="print-btn" onclick="window.print()">Imprimer / Enregistrer en PDF</button></div>
+  <div class="sheet">
+    <h1>ChemBase R&amp;D — Feuille de Paillasse (Essai #{eid})</h1>
+    <h2>{prod}</h2>
+    <div class="grid">
+      <div class="box"><div class="lbl">Date</div><div class="val">{dt}</div></div>
+      <div class="box"><div class="lbl">Opérateur</div><div class="val">{op}</div></div>
+      <div class="box"><div class="lbl">Statut</div><div class="val">{st}</div></div>
+      <div class="box"><div class="lbl">Masse théorique</div><div class="val">{mt:.2f} g</div></div>
+      <div class="box"><div class="lbl">Masse obtenue</div><div class="val">{mo:.2f} g</div></div>
+      <div class="box"><div class="lbl">Rendement réel (Réf : {rdt_ref})</div><div class="val" style="color:#059669;">{rdt:.1f} %</div></div>
+    </div>
+    <div class="sec"><h3>Quantités engagées</h3><p style="margin:0;line-height:1.6;">{qtes}</p></div>
+    <div class="sec"><h3>Observations, Analyses &amp; Notes</h3><p style="margin:0;line-height:1.6;white-space:pre-wrap;">{obs}</p></div>
+    <div class="foot"><span>CHEMBASE CAHIER DE LABORATOIRE</span><span>Exporté le {datetime.now().strftime("%d/%m/%Y à %H:%M")}</span></div>
+  </div>
+</body></html>"""
 
 
 def generate_molecule_html(row: dict) -> bytes:
@@ -742,13 +907,33 @@ def generate_molecule_html(row: dict) -> bytes:
     rxn_smi = build_specific_reaction_smiles(row)
     rxn_svg_url = get_vector_depict_url(rxn_smi, style="cow", w=600, h=180, zoom=2.4) if rxn_smi else None
     pc_url, sig_url = get_safety_fds_links(cas, prod)
-    fds_links_html = f'<p style="margin-top:12px;"><strong>FDS Officielles :</strong> <a href="{pc_url}" target="_blank" style="color:#059669;margin-right:15px;">PubChem (LCSS) &nearr;</a> <a href="{sig_url}" target="_blank" style="color:#059669;">Sigma-Aldrich (Merck) &nearr;</a></p>' if pc_url else ""
+    fds_links_html = f'<p class="no-print" style="margin-top:12px;"><strong>FDS Officielles :</strong> <a href="{pc_url}" target="_blank" style="color:#059669;margin-right:15px;">PubChem (LCSS) &nearr;</a> <a href="{sig_url}" target="_blank" style="color:#059669;">Sigma-Aldrich (Merck) &nearr;</a></p>' if pc_url else ""
     img_tag = f'<img src="{img_2d}" alt="2D" style="float:right;width:160px;border:1px solid #cbd5e1;border-radius:8px;background:white;padding:6px;margin-left:15px;">' if img_2d else ""
     rxn_block = f'<div style="background:white;border:1px solid #cbd5e1;border-radius:8px;padding:10px;text-align:center;margin-top:12px;"><img src="{rxn_svg_url}" style="max-width:100%;height:auto;"></div>' if rxn_svg_url else ""
+    valid_sgh = extract_sgh_codes(clean_val(row.get("Pictogrammes danger")))
+    sgh_svgs = "".join([f'<span style="display:inline-flex;flex-direction:column;align-items:center;margin-right:8px;">{SGH_SVG_MAP[c]}<small style="font-family:monospace;font-size:9px;">{c}</small></span>' for c, _ in valid_sgh])
+    sgh_line = f'<div style="display:flex;align-items:center;flex-wrap:wrap;margin-top:8px;">{sgh_svgs}</div>' if sgh_svgs else "Aucun"
     doc = f"""<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><title>Fiche - {html.escape(prod)}</title>
-    <style>body{{font-family:'Helvetica Neue',Arial,sans-serif;margin:40px;color:#0f172a;background:#f4f7f6}}.container{{max-width:820px;background:white;padding:40px;border-radius:10px;border:1px solid #d5e0dc}}h1{{color:#059669;border-bottom:2px solid #059669;padding-bottom:10px;margin-top:0;font-size:1.35rem;letter-spacing:0.04em;text-transform:uppercase}}.badge{{background:#ecfdf5;color:#059669;border:1px solid #059669;padding:4px 10px;border-radius:4px;font-size:0.85rem;font-weight:600;display:inline-block}}.section{{margin-top:25px;padding:18px;background:#f8fafc;border-radius:6px;border-left:3px solid #059669;overflow:hidden}}.footer{{margin-top:40px;text-align:center;font-size:0.78rem;color:#64748b;border-top:1px solid #e2e8f0;padding-top:10px;font-family:monospace}}</style></head>
-    <body><div class="container"><h1>ChemBase R&amp;D — Spécification Technique</h1><h2>{html.escape(prod)} {f"<span style='font-family:monospace;font-size:1rem;color:#64748b;'>[CAS {html.escape(cas)}]</span>" if cas else ""}</h2>
-    <div class="section"><h3>01 / Paramètres &amp; Équation de Réaction</h3><p><strong>Voie principale :</strong> {rx_html}</p><p><strong>Réactifs :</strong> {html.escape(", ".join(reas) or "N/A")}</p><p><strong>Rendement de référence :</strong> {html.escape(clean_val(row.get("Rendement")) or "N/A")}</p><p><strong>Conditions opératoires :</strong> {html.escape(clean_val(row.get("Conditions opératoires")) or "N/A")}</p>{f"<p><strong>Notes :</strong> {html.escape(comm)}</p>" if comm else ""}{rxn_block}</div>
-    <div class="section">{img_tag}<h3>02 / Propriétés Physico-Chimiques &amp; Sécurité</h3><p><strong>Formule &amp; Masse :</strong> {html.escape(clean_val(row.get("Formule brute & masse")) or "N/A")}</p><p><strong>Densité :</strong> {dens_str}</p><p><strong>État physique :</strong> {html.escape(clean_val(row.get("État physique")) or "N/A")}</p><p><strong>Classification SGH :</strong> {html.escape(clean_val(row.get("Pictogrammes danger")) or "Aucun")}</p><p><strong>Disponibilité :</strong> {html.escape(clean_val(row.get("Rareté & Coût")) or "N/A")}</p><p><strong>Stockage :</strong> {html.escape(clean_val(row.get("Conditions de stockage")) or "N/A")}</p>{fds_links_html}</div>
-    <div class="footer">CHEMBASE R&amp;D SYSTEM — EXPORT DU {datetime.now().strftime('%d/%m/%Y %H:%M')}</div></div></body></html>"""
+    <style>
+      body{{font-family:'Helvetica Neue',Arial,sans-serif;margin:36px;color:#0f172a;background:#f4f7f6}}
+      .toolbar{{max-width:820px;margin:0 auto 14px auto;text-align:right}}
+      .print-btn{{background:#059669;color:#fff;border:none;border-radius:8px;padding:9px 16px;font-weight:700;cursor:pointer}}
+      .container{{max-width:820px;margin:0 auto;background:white;padding:38px;border-radius:10px;border:1px solid #d5e0dc}}
+      h1{{color:#059669;border-bottom:2px solid #059669;padding-bottom:10px;margin-top:0;font-size:1.3rem;letter-spacing:0.04em;text-transform:uppercase}}
+      .badge{{background:#ecfdf5;color:#059669;border:1px solid #059669;padding:4px 10px;border-radius:4px;font-size:0.85rem;font-weight:600;display:inline-block}}
+      .section{{margin-top:22px;padding:18px;background:#f8fafc;border-radius:6px;border-left:3px solid #059669;overflow:hidden}}
+      .sgh-svg{{width:34px;height:34px}}
+      .footer{{margin-top:34px;text-align:center;font-size:0.78rem;color:#64748b;border-top:1px solid #e2e8f0;padding-top:10px;font-family:monospace}}
+      @media print{{body{{background:#fff;margin:0}}.toolbar,.no-print{{display:none!important}}.container{{border:none;padding:8mm;max-width:100%}}}}
+    </style></head>
+    <body>
+      <div class="toolbar"><button class="print-btn" onclick="window.print()">Imprimer / Enregistrer en PDF</button></div>
+      <div class="container">
+        <h1>ChemBase R&amp;D — Spécification Technique</h1>
+        <h2>{html.escape(prod)} {f"<span style='font-family:monospace;font-size:1rem;color:#64748b;'>[CAS {html.escape(cas)}]</span>" if cas else ""}</h2>
+        <div class="section"><h3>01 / Paramètres &amp; Équation de Réaction</h3><p><strong>Voie principale :</strong> {rx_html}</p><p><strong>Réactifs :</strong> {html.escape(", ".join(reas) or "N/A")}</p><p><strong>Rendement de référence :</strong> {html.escape(clean_val(row.get("Rendement")) or "N/A")}</p><p><strong>Conditions opératoires :</strong> {html.escape(clean_val(row.get("Conditions opératoires")) or "N/A")}</p>{f"<p><strong>Notes :</strong> {html.escape(comm)}</p>" if comm else ""}{rxn_block}</div>
+        <div class="section">{img_tag}<h3>02 / Propriétés Physico-Chimiques &amp; Sécurité</h3><p><strong>Formule &amp; Masse :</strong> {html.escape(clean_val(row.get("Formule brute & masse")) or "N/A")}</p><p><strong>Densité :</strong> {dens_str}</p><p><strong>État physique :</strong> {html.escape(clean_val(row.get("État physique")) or "N/A")}</p><p><strong>Classification SGH :</strong></p>{sgh_line}<p><strong>Disponibilité :</strong> {html.escape(clean_val(row.get("Rareté & Coût")) or "N/A")}</p><p><strong>Stockage :</strong> {html.escape(clean_val(row.get("Conditions de stockage")) or "N/A")}</p>{fds_links_html}</div>
+        <div class="footer">CHEMBASE R&amp;D SYSTEM — EXPORT DU {datetime.now().strftime('%d/%m/%Y %H:%M')}</div>
+      </div>
+    </body></html>"""
     return doc.encode("utf-8")
