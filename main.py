@@ -3,6 +3,7 @@ import os
 from typing import Any
 from fastapi.responses import HTMLResponse, JSONResponse
 from nicegui import app, ui
+import base64
 
 from chem_data import (
     LABO_FILES_DIR,
@@ -119,13 +120,30 @@ def api_v1_molecule(cas: str):
     return JSONResponse(content=dict(row))
 
 
-def find_favicon():
+DEFAULT_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">'
+    '<defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">'
+    '<stop offset="0%" stop-color="#10b981"/>'
+    '<stop offset="55%" stop-color="#38bdf8"/>'
+    '<stop offset="100%" stop-color="#1d4ed8"/>'
+    '</linearGradient></defs>'
+    '<rect width="120" height="120" rx="26" fill="#0b1212"/>'
+    '<polygon points="60,12 102,36 102,84 60,108 18,84 18,36" '
+    'fill="none" stroke="url(#g)" stroke-width="9" stroke-linejoin="round"/>'
+    '<text x="60" y="74" text-anchor="middle" font-family="Arial, sans-serif" '
+    'font-size="40" font-weight="800" fill="#f8fafc">CB</text>'
+    '</svg>'
+)
+
+
+def find_favicon() -> str:
     for folder in (BASE_DIR, IMAGES_DIR):
-        for ext in ("png", "jpg", "jpeg", "ico"):
+        for ext in ("png", "ico", "svg", "jpg", "jpeg"):
             path = os.path.join(folder, f"chembase_logo.{ext}")
             if os.path.exists(path):
                 return path
-    return None
+    b64 = base64.b64encode(DEFAULT_FAVICON_SVG.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{b64}"
 
 
 @ui.page("/")
