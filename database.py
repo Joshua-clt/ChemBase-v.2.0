@@ -1,18 +1,21 @@
+import atexit
 import base64
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 from typing import Any
 
-from chem_data import BASE_COLS, FAST_DENSITY_MAP, clean_val, get_known_density
+from chem_data import BASE_COLS, FAST_DENSITY_MAP, LABO_FILES_DIR, clean_val, get_known_density
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "chimie_db.sqlite")
@@ -20,16 +23,21 @@ DB_FILE = os.path.join(BASE_DIR, "chimie_db.sqlite")
 PBKDF2_ITERATIONS = 120_000
 MAX_AUTH_FAILS = 5
 LOCKOUT_SECONDS = 60
+SYNC_DEBOUNCE_SECONDS = 3.0
 
 _AUTH_ATTEMPTS: dict[str, dict[str, Any]] = {}
+_SYNC_LOCK = threading.Lock()
+_SYNC_TIMER_LOCK = threading.Lock()
+_SYNC_TIMER: threading.Timer | None = None
 
 GITHUB_SYNC_STATUS: dict[str, Any] = {
     "configured": bool(os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO")),
     "repo": os.environ.get("GITHUB_REPO", ""),
     "last_sync": "Aucune synchronisation sur cette session",
     "last_ok": None,
+    "pending": False,
     "message": (
-        "Prêt pour la sauvegarde automatique sur GitHub."
+        "Prêt pour la sauvegarde asynchrone sur GitHub."
         if (os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO"))
         else "Mode local uniquement (GITHUB_TOKEN / GITHUB_REPO non configurés)."
     ),
@@ -66,7 +74,6 @@ def verify_password(plain_password: str, stored_value: str) -> bool:
 
 
 def _check_rate_limit(bucket: str) -> int:
-    """Retourne le nombre de secondes restantes de blocage (0 si autorisé)."""
     rec = _AUTH_ATTEMPTS.get(bucket)
     if not rec:
         return 0
@@ -114,50 +121,99 @@ def sync_db_to_github():
     repo = os.environ.get("GITHUB_REPO")
     if not token or not repo or not os.path.exists(DB_FILE):
         GITHUB_SYNC_STATUS["configured"] = False
+        GITHUB_SYNC_STATUS["pending"] = False
         return
     GITHUB_SYNC_STATUS["configured"] = True
     GITHUB_SYNC_STATUS["repo"] = repo
-    try:
-        url = f"https://api.github.com/repos/{repo}/contents/chimie_db.sqlite"
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "ChemBase-v2",
-            "Content-Type": "application/json",
-        }
-        sha = None
+
+    with _SYNC_LOCK:
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8) as r:
-                sha = json.loads(r.read().decode("utf-8")).get("sha")
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                GITHUB_SYNC_STATUS["last_ok"] = False
-                GITHUB_SYNC_STATUS["message"] = f"Erreur HTTP {e.code} lors de la lecture GitHub."
-                return
-        with open(DB_FILE, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-        payload: dict[str, Any] = {
-            "message": f"Auto-save DB ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})",
-            "content": b64,
-        }
-        if sha:
-            payload["sha"] = sha
-        urllib.request.urlopen(
-            urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT"),
-            timeout=12,
-        )
-        GITHUB_SYNC_STATUS["last_sync"] = datetime.now().strftime("%d/%m/%Y à %H:%M:%S")
-        GITHUB_SYNC_STATUS["last_ok"] = True
-        GITHUB_SYNC_STATUS["message"] = "Base SQLite synchronisée sur GitHub."
-    except Exception as ex:
-        GITHUB_SYNC_STATUS["last_ok"] = False
-        GITHUB_SYNC_STATUS["message"] = f"Échec synchro GitHub : {ex}"
+            url = f"https://api.github.com/repos/{repo}/contents/chimie_db.sqlite"
+            headers = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "ChemBase-v2",
+                "Content-Type": "application/json",
+            }
+            sha = None
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8) as r:
+                    sha = json.loads(r.read().decode("utf-8")).get("sha")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    GITHUB_SYNC_STATUS["last_ok"] = False
+                    GITHUB_SYNC_STATUS["pending"] = False
+                    GITHUB_SYNC_STATUS["message"] = f"Erreur HTTP {e.code} lors de la lecture GitHub."
+                    return
+            with open(DB_FILE, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+            payload: dict[str, Any] = {
+                "message": f"Auto-save DB ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})",
+                "content": b64,
+            }
+            if sha:
+                payload["sha"] = sha
+            urllib.request.urlopen(
+                urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT"),
+                timeout=15,
+            )
+            GITHUB_SYNC_STATUS["last_sync"] = datetime.now().strftime("%d/%m/%Y à %H:%M:%S")
+            GITHUB_SYNC_STATUS["last_ok"] = True
+            GITHUB_SYNC_STATUS["pending"] = False
+            GITHUB_SYNC_STATUS["message"] = "Base SQLite synchronisée sur GitHub (arrière-plan)."
+        except Exception as ex:
+            GITHUB_SYNC_STATUS["last_ok"] = False
+            GITHUB_SYNC_STATUS["pending"] = False
+            GITHUB_SYNC_STATUS["message"] = f"Échec synchro GitHub : {ex}"
+
+
+def _run_background_sync():
+    global _SYNC_TIMER
+    with _SYNC_TIMER_LOCK:
+        _SYNC_TIMER = None
+    sync_db_to_github()
+
+
+def schedule_github_sync():
+    """Déclenche une synchro GitHub non bloquante après un regroupement de 3 s."""
+    global _SYNC_TIMER
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPO")
+    if not token or not repo or not os.path.exists(DB_FILE):
+        GITHUB_SYNC_STATUS["configured"] = False
+        return
+    with _SYNC_TIMER_LOCK:
+        if _SYNC_TIMER is not None:
+            _SYNC_TIMER.cancel()
+        GITHUB_SYNC_STATUS["configured"] = True
+        GITHUB_SYNC_STATUS["repo"] = repo
+        GITHUB_SYNC_STATUS["pending"] = True
+        GITHUB_SYNC_STATUS["message"] = "Modifications en file d'attente (envoi GitHub sous 3 s)..."
+        t = threading.Timer(SYNC_DEBOUNCE_SECONDS, _run_background_sync)
+        t.daemon = True
+        t.start()
+        _SYNC_TIMER = t
+
+
+def _flush_sync_on_exit():
+    global _SYNC_TIMER
+    should_flush = False
+    with _SYNC_TIMER_LOCK:
+        if _SYNC_TIMER is not None:
+            _SYNC_TIMER.cancel()
+            _SYNC_TIMER = None
+            should_flush = True
+    if should_flush:
+        sync_db_to_github()
+
+
+atexit.register(_flush_sync_on_exit)
 
 
 class SyncedConnection(sqlite3.Connection):
     def commit(self):
         super().commit()
-        sync_db_to_github()
+        schedule_github_sync()
 
 
 def get_connection(sync: bool = True):
@@ -275,7 +331,13 @@ def init_db():
         cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT, warnings INTEGER DEFAULT 0, warning_acknowledged INTEGER DEFAULT 1, is_root INTEGER DEFAULT 0)")
         cur.execute("CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, requested_at TEXT, status TEXT DEFAULT 'pending')")
         cur.execute("CREATE TABLE IF NOT EXISTS favorites (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, product_name TEXT, UNIQUE(username, product_name))")
-        cur.execute("CREATE TABLE IF NOT EXISTS lab_notebook (id INTEGER PRIMARY KEY AUTOINCREMENT, date_essai TEXT, operateur TEXT, produit_cible TEXT, quantites_engagees TEXT, masse_theorique REAL, masse_obtenue REAL, rendement_reel REAL, rendement_theorique TEXT, statut TEXT, observations TEXT, attachment_path TEXT)")
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS lab_notebook ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, date_essai TEXT, operateur TEXT, produit_cible TEXT, "
+            "quantites_engagees TEXT, masse_theorique REAL, masse_obtenue REAL, rendement_reel REAL, "
+            "rendement_theorique TEXT, statut TEXT, observations TEXT, attachment_path TEXT, "
+            "attachment_name TEXT, attachment_mime TEXT, attachment_data BLOB)"
+        )
         cur.execute("CREATE TABLE IF NOT EXISTS inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, nom_substance TEXT UNIQUE, categorie TEXT, quantite REAL, unite TEXT, seuil_alerte REAL, emplacement TEXT, derniere_maj TEXT, densite REAL DEFAULT 1.0)")
         cur.execute("CREATE TABLE IF NOT EXISTS stock_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, nom_substance TEXT, alert_level TEXT, quantite REAL, unite TEXT, seuil REAL, is_read INTEGER DEFAULT 0)")
         cur.execute(
@@ -292,6 +354,9 @@ def init_db():
 
         for alter_sql in (
             "ALTER TABLE lab_notebook ADD COLUMN attachment_path TEXT",
+            "ALTER TABLE lab_notebook ADD COLUMN attachment_name TEXT",
+            "ALTER TABLE lab_notebook ADD COLUMN attachment_mime TEXT",
+            "ALTER TABLE lab_notebook ADD COLUMN attachment_data BLOB",
             "ALTER TABLE inventory ADD COLUMN densite REAL DEFAULT 1.0",
             "ALTER TABLE admin_audit_logs ADD COLUMN payload_json TEXT",
             "ALTER TABLE admin_audit_logs ADD COLUMN reverted INTEGER DEFAULT 0",
@@ -304,9 +369,12 @@ def init_db():
             except Exception:
                 pass
 
-        # Paramètres par défaut (Code Laboratoire Option A)
         cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('lab_access_code', 'CHEM-2026')")
         cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('registration_open', '1')")
+        cur.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('chemstudio_api_key', ?)",
+            (f"cb_{secrets.token_urlsafe(24)}",),
+        )
 
         if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             cur.executemany(
@@ -317,13 +385,11 @@ def init_db():
                 ],
             )
         else:
-            # Migration transparente des anciens mots de passe en clair vers PBKDF2-SHA256
             for urow in cur.execute("SELECT id, password FROM users").fetchall():
                 pwd = urow["password"] or ""
                 if pwd and not pwd.startswith("pbkdf2_sha256$"):
                     cur.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(pwd), urow["id"]))
 
-            # Attribution automatique du statut Fondateur (is_root=1) au compte superadmin originel
             has_root = cur.execute("SELECT COUNT(*) FROM users WHERE is_root = 1").fetchone()[0]
             if has_root == 0:
                 orig = cur.execute("SELECT id FROM users WHERE LOWER(username) = 'superadmin' LIMIT 1").fetchone()
@@ -337,7 +403,7 @@ def init_db():
 
 
 # ------------------------------------------------------------------
-# PARAMÈTRES SYSTÈME (CODE ACCÈS LABORATOIRE)
+# PARAMÈTRES SYSTÈME (CODE LABO & CLÉ API CHEMSTUDIO)
 # ------------------------------------------------------------------
 def get_lab_registration_settings() -> dict[str, Any]:
     with get_connection(sync=False) as conn:
@@ -373,6 +439,41 @@ def update_lab_registration_settings(new_code: str, is_open: bool, actor_usernam
         )
         conn.commit()
     return True, f"Paramètres d'inscription enregistrés ({'ouvertes' if is_open else 'fermées'})."
+
+
+def get_api_key() -> tuple[str, bool]:
+    """Retourne (api_key, from_env). La variable Render CHEMSTUDIO_API_KEY est prioritaire."""
+    env_key = clean_val(os.environ.get("CHEMSTUDIO_API_KEY"))
+    if env_key:
+        return env_key, True
+    with get_connection(sync=False) as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = 'chemstudio_api_key'").fetchone()
+        if row and clean_val(row["value"]):
+            return clean_val(row["value"]), False
+    new_key = f"cb_{secrets.token_urlsafe(24)}"
+    with get_connection(sync=True) as conn:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('chemstudio_api_key', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (new_key,),
+        )
+        conn.commit()
+    return new_key, False
+
+
+def rotate_api_key(actor_username: str) -> tuple[bool, str]:
+    if clean_val(os.environ.get("CHEMSTUDIO_API_KEY")):
+        return False, "La clé est définie par la variable d'environnement CHEMSTUDIO_API_KEY (modifiez-la dans Render)."
+    new_key = f"cb_{secrets.token_urlsafe(24)}"
+    with get_connection(sync=True) as conn:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('chemstudio_api_key', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (new_key,),
+        )
+        _log_activity_conn(conn, actor_username, "ADMIN", "Clé API ChemStudio régénérée", "Ancienne clé immédiatement révoquée")
+        conn.commit()
+    return True, "Nouvelle clé API générée (l'ancienne clé ne fonctionne plus)."
 
 
 def _safe_count(cur: sqlite3.Cursor, query: str) -> int:
@@ -464,7 +565,6 @@ def insert_pending_synthese(values_16: list[str], author_username: str = "cherch
 
 
 def insert_direct_synthese(values_16: list[str], admin_username: str) -> int:
-    """Publication directe dans le Catalogue (réservée au Super-Admin)."""
     cols_str = ", ".join([f"[{c}]" for c in BASE_COLS])
     snap = {c: clean_val(values_16[idx]) if idx < len(values_16) else "" for idx, c in enumerate(BASE_COLS)}
     prod_name = snap["Produit final"] or "Sans nom"
@@ -701,11 +801,46 @@ def delete_inventory_item(item_id: int, operator: str = "chercheur"):
 
 
 # ------------------------------------------------------------------
-# CAHIER DE LABORATOIRE
+# CAHIER DE LABORATOIRE & PIÈCES JOINTES PERSISTANTES (BLOB SQLITE)
 # ------------------------------------------------------------------
 def get_all_labo_entries() -> list[dict[str, Any]]:
     with get_connection(sync=False) as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM lab_notebook ORDER BY id DESC").fetchall()]
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, date_essai, operateur, produit_cible, quantites_engagees, "
+                "masse_theorique, masse_obtenue, rendement_reel, rendement_theorique, "
+                "statut, observations, attachment_path, attachment_name, attachment_mime, "
+                "CASE WHEN attachment_data IS NOT NULL AND LENGTH(attachment_data) > 0 THEN 1 ELSE 0 END AS has_blob "
+                "FROM lab_notebook ORDER BY id DESC"
+            ).fetchall()
+        ]
+
+
+def get_labo_attachment(entry_id: int) -> tuple[str, str, bytes] | None:
+    """Récupère la pièce jointe stockée en BLOB SQLite (avec repli compatible sur anciens fichiers disque)."""
+    with get_connection(sync=False) as conn:
+        row = conn.execute(
+            "SELECT attachment_name, attachment_mime, attachment_data, attachment_path FROM lab_notebook WHERE id = ?",
+            (int(entry_id),),
+        ).fetchone()
+    if not row:
+        return None
+    blob = row["attachment_data"]
+    if blob:
+        fname = clean_val(row["attachment_name"]) or f"piece_jointe_{entry_id}"
+        mime = clean_val(row["attachment_mime"]) or mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        return fname, mime, bytes(blob)
+    legacy_path = clean_val(row["attachment_path"])
+    if legacy_path:
+        disk_path = os.path.join(LABO_FILES_DIR, os.path.basename(legacy_path))
+        if os.path.exists(disk_path):
+            with open(disk_path, "rb") as f:
+                raw = f.read()
+            fname = os.path.basename(disk_path)
+            mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+            return fname, mime, raw
+    return None
 
 
 def insert_labo_entry(
@@ -720,16 +855,22 @@ def insert_labo_entry(
     statut: str,
     observations: str,
     attachment_path: str = "",
+    attachment_name: str = "",
+    attachment_mime: str = "",
+    attachment_data: bytes | None = None,
 ):
     with get_connection(sync=True) as conn:
         conn.execute(
             "INSERT INTO lab_notebook (date_essai, operateur, produit_cible, quantites_engagees, masse_theorique, "
-            "masse_obtenue, rendement_reel, rendement_theorique, statut, observations, attachment_path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "masse_obtenue, rendement_reel, rendement_theorique, statut, observations, attachment_path, "
+            "attachment_name, attachment_mime, attachment_data) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 date_essai, operateur, produit_cible, quantites_engagees,
                 round(float(masse_theorique), 2), round(float(masse_obtenue), 2),
-                round(float(rendement_reel), 1), rendement_theorique, statut, observations, attachment_path,
+                round(float(rendement_reel), 1), rendement_theorique, statut, observations,
+                attachment_path, attachment_name, attachment_mime,
+                sqlite3.Binary(attachment_data) if attachment_data else None,
             ),
         )
         _log_activity_conn(

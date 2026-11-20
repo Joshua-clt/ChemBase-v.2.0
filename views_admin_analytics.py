@@ -1,6 +1,7 @@
 from collections import Counter
 from datetime import datetime
 import html
+import json
 import re
 from typing import Any
 from nicegui import app, run, ui
@@ -18,6 +19,7 @@ from database import (
     get_all_labo_entries,
     get_all_syntheses,
     get_all_users,
+    get_api_key,
     get_audit_logs,
     get_db_backup_bytes,
     get_github_sync_status,
@@ -31,6 +33,7 @@ from database import (
     read_db_status,
     reject_pending_synthese,
     resolve_password_reset,
+    rotate_api_key,
     sync_db_to_github,
     update_lab_registration_settings,
     update_synthese_by_id,
@@ -325,7 +328,7 @@ def build_analytics_and_admin_views(app_state: dict[str, Any], on_data_changed=N
         return refresh_analytics
 
     # ------------------------------------------------------------------
-    # ONGLET 6 : ADMINISTRATION, MODÉRATION, ACTIVITÉ LABO, VETO, COMPTES & BACKUP
+    # ONGLET 6 : ADMINISTRATION, MODÉRATION, ACTIVITÉ LABO, VETO, COMPTES & SYSTÈME
     # ------------------------------------------------------------------
     def render_admin_tab():
         admin_root = ui.element("div")
@@ -602,7 +605,7 @@ def build_analytics_and_admin_views(app_state: dict[str, Any], on_data_changed=N
                         f'<strong style="color:var(--txt);">Gouvernance : {html.escape(adm_name)}</strong>'
                         f'<span class="mono-tag">{html.escape(str(cur_auth["role"]).upper())}</span>'
                         f'{root_pill}'
-                        f'<span class="muted-small">PBKDF2-SHA256 actif</span>'
+                        f'<span class="muted-small">PBKDF2-SHA256 · Routes sécurisées</span>'
                         f'</div>'
                     )
 
@@ -616,7 +619,7 @@ def build_analytics_and_admin_views(app_state: dict[str, Any], on_data_changed=N
                         sub_tabs.append(("audit", "Journal d'Audit & Veto"))
                         u_lbl = f"Comptes & Code Labo ({len(pending_resets)} MDP)" if pending_resets else "Comptes & Code Labo"
                         sub_tabs.append(("users", u_lbl))
-                        sub_tabs.append(("system", "Sauvegarde & Sync"))
+                        sub_tabs.append(("system", "Sauvegarde, Sync & API"))
 
                     with ui.element("div").style("display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"):
                         for s_key, s_lbl in sub_tabs:
@@ -856,7 +859,6 @@ def build_analytics_and_admin_views(app_state: dict[str, Any], on_data_changed=N
                     users = get_all_users()
                     reg_cfg = get_lab_registration_settings()
 
-                    # Carte Option A : Code Laboratoire rotatif + interrupteur On/Off
                     with ui.element("div").classes("hud-card").style("margin-bottom:16px;border-left:3px solid var(--cyan);"):
                         safe_html(
                             '<div class="section-kicker">INSCRIPTION AUTONOME SÉCURISÉE (OPTION A)</div>'
@@ -958,19 +960,24 @@ def build_analytics_and_admin_views(app_state: dict[str, Any], on_data_changed=N
 
                             _btn("Créer le compte", classes="glass-btn glass-btn-accent", on_click=do_create)
 
-                # --- SECTION 7 : SAUVEGARDE SQLITE & SYNCHRO GITHUB (SUPER-ADMIN UNIQUEMENT) ---
+                # --- SECTION 7 : SAUVEGARDE SQLITE, SYNC ASYNC & CLÉ API CHEMSTUDIO ---
                 elif sec == "system" and is_super:
                     gh = get_github_sync_status()
                     db_bytes = get_db_backup_bytes()
                     size_kb = len(db_bytes) / 1024.0
-                    sync_dot = "status-ok" if gh["last_ok"] is True else ("status-err" if gh["last_ok"] is False else "status-warn")
+                    sync_dot = (
+                        "status-warn" if gh.get("pending")
+                        else ("status-ok" if gh["last_ok"] is True else ("status-err" if gh["last_ok"] is False else "status-warn"))
+                    )
+                    api_key, from_env = get_api_key()
+                    copy_key_js = html.escape(f"window.cbCopyText({json.dumps(api_key)}, 'Clé API ChemStudio')", quote=True)
 
-                    with ui.element("div").classes("modal-grid"):
+                    with ui.element("div").classes("modal-grid").style("margin-bottom:16px;"):
                         with ui.element("div").classes("hud-card"):
                             safe_html(
                                 '<div class="section-kicker">ARCHIVE COMPLÈTE</div>'
                                 '<h2>Sauvegarde Locale SQLite</h2>'
-                                f'<p class="muted-text" style="margin-bottom:14px;">Téléchargez une copie instantanée de <code>chimie_db.sqlite</code> ({size_kb:.1f} Ko) contenant le catalogue, l\'inventaire, les mouvements, le Cahier de Laboratoire, les comptes hachés et les journaux.</p>'
+                                f'<p class="muted-text" style="margin-bottom:14px;">Téléchargez une copie instantanée de <code>chimie_db.sqlite</code> ({size_kb:.1f} Ko) contenant le catalogue, l\'inventaire, les mouvements, le Cahier de Laboratoire (pièces jointes BLOB incluses), les comptes hachés et les journaux.</p>'
                             )
 
                             def download_backup(_e=None):
@@ -990,25 +997,52 @@ def build_analytics_and_admin_views(app_state: dict[str, Any], on_data_changed=N
 
                         with ui.element("div").classes("hud-card"):
                             safe_html(
-                                '<div class="section-kicker">PERSISTANCE CLOUD (RENDER)</div>'
+                                '<div class="section-kicker">PERSISTANCE CLOUD · ASYNCHRONE (RENDER)</div>'
                                 '<h2>Synchronisation GitHub</h2>'
                                 f'<div class="kv-grid" style="margin-bottom:12px;">'
-                                f'<div class="kv-item"><div class="kv-label">Configuration</div><div class="kv-val">{"Active (" + html.escape(gh["repo"]) + ")" if gh["configured"] else "Mode local"}</div></div>'
-                                f'<div class="kv-item"><div class="kv-label">Dernière synchro</div><div class="kv-val">{html.escape(gh["last_sync"])}</div></div>'
+                                f'<div class="kv-item"><div class="kv-label">Configuration</div><div class="kv-val">{"Active (" + html.escape(str(gh["repo"])) + ")" if gh["configured"] else "Mode local"}</div></div>'
+                                f'<div class="kv-item"><div class="kv-label">Dernière synchro</div><div class="kv-val">{html.escape(str(gh["last_sync"]))}</div></div>'
                                 f'</div>'
                                 f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;">'
                                 f'<span class="status-dot {sync_dot}"></span>'
-                                f'<span class="muted-small">{html.escape(gh["message"])}</span></div>'
+                                f'<span class="muted-small">{html.escape(str(gh["message"]))}</span></div>'
                             )
                             if gh["configured"]:
                                 async def force_sync(_e=None):
                                     ui.notify("Synchronisation vers GitHub en cours...", type="info")
                                     await run.io_bound(sync_db_to_github)
                                     st_now = get_github_sync_status()
-                                    ui.notify(st_now["message"], type="positive" if st_now["last_ok"] else "negative")
+                                    ui.notify(str(st_now["message"]), type="positive" if st_now["last_ok"] else "negative")
                                     refresh_admin()
 
                                 _btn("Forcer une synchronisation maintenant", on_click=force_sync)
+
+                    with ui.element("div").classes("hud-card").style("border-left:3px solid var(--accent);"):
+                        src_lbl = "Variable d'environnement Render (CHEMSTUDIO_API_KEY)" if from_env else "Générée automatiquement dans SQLite"
+                        safe_html(
+                            '<div class="section-kicker">PONT EXTERNE · SÉCURITÉ API (FUTUR CHEMSTUDIO)</div>'
+                            '<h2>Clé d\'Accès API REST</h2>'
+                            f'<p class="muted-small" style="margin-bottom:12px;">Les routes <code>/api/v1/catalog</code> et <code>/api/v1/molecule/{{cas}}</code> exigent désormais soit une session ChemBase connectée, soit l\'en-tête HTTP <code>X-API-Key</code> ci-dessous ({html.escape(src_lbl)}).</p>'
+                            f'<div class="kv-item copyable-tag" style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;" '
+                            f'title="Cliquer pour copier la clé API" onclick="{copy_key_js}">'
+                            f'<div><div class="kv-label">X-API-Key (clic pour copier)</div>'
+                            f'<div class="kv-val" style="font-family:\'JetBrains Mono\',monospace;color:var(--cyan);">{html.escape(api_key)}</div></div>'
+                            f'<span class="mono-tag">Copier ⧉</span></div>'
+                        )
+                        if not from_env:
+                            def ask_rotate(_e=None):
+                                def do_rotate():
+                                    ok, msg = rotate_api_key(adm_name)
+                                    ui.notify(msg, type="positive" if ok else "negative")
+                                    refresh_admin()
+                                open_confirm_action(
+                                    "Régénérer la clé API ChemStudio ?",
+                                    "L'ancienne clé sera immédiatement révoquée et devra être mise à jour dans vos modules externes.",
+                                    "Régénérer la clé",
+                                    do_rotate,
+                                )
+
+                            _btn("Régénérer une nouvelle clé API", classes="glass-btn glass-btn-danger", on_click=ask_rotate)
 
         refresh_admin()
         return refresh_admin

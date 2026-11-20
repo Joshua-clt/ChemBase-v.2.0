@@ -1,9 +1,14 @@
+import base64
+import hashlib
+import hmac
 import html
 import os
+import time
+import urllib.parse
 from typing import Any
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from nicegui import app, ui
-import base64
 
 from chem_data import (
     LABO_FILES_DIR,
@@ -12,6 +17,7 @@ from chem_data import (
     generate_bottle_label_html,
     generate_labo_entry_html,
     generate_molecule_html,
+    sanitize_filename,
 )
 from database import (
     authenticate_user_checked,
@@ -19,7 +25,9 @@ from database import (
     get_all_inventory,
     get_all_labo_entries,
     get_all_syntheses,
+    get_api_key,
     get_lab_registration_settings,
+    get_labo_attachment,
     get_user_by_username,
     init_db,
     log_activity,
@@ -38,20 +46,109 @@ IMAGES_DIR = os.path.join(BASE_DIR, "images")
 os.makedirs(IMAGES_DIR, exist_ok=True)
 os.makedirs(LABO_FILES_DIR, exist_ok=True)
 
+IS_RENDER = os.environ.get("RENDER") is not None
+STORAGE_SECRET = os.environ.get("STORAGE_SECRET", "chembase-swiss-biotech-2026")
+SESSION_COOKIE_NAME = "cb_auth"
+SESSION_TTL_SECONDS = 7 * 24 * 3600
+
 init_db()
-app.add_static_files("/images", IMAGES_DIR)
 
 
 # ------------------------------------------------------------------
-# ROUTES API (3D, ÉTIQUETTES, IMPRESSION PDF & PONT FUTUR CHEMSTUDIO)
+# JETONS & COOKIES SIGNÉS HMAC-SHA256 POUR VERROUILLER LES ROUTES API
+# ------------------------------------------------------------------
+def _sign_token(purpose: str, username: str, ttl_seconds: int) -> str:
+    exp = int(time.time()) + int(ttl_seconds)
+    u_b64 = base64.urlsafe_b64encode(username.encode("utf-8")).decode("ascii").rstrip("=")
+    payload = f"{purpose}.{u_b64}.{exp}"
+    sig = hmac.new(STORAGE_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def _verify_token(purpose: str, token: str) -> str | None:
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 4 or parts[0] != purpose:
+        return None
+    _p, u_b64, exp_s, sig = parts
+    try:
+        if int(exp_s) < int(time.time()):
+            return None
+        payload = f"{purpose}.{u_b64}.{exp_s}"
+        expected = hmac.new(STORAGE_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        pad = "=" * (-len(u_b64) % 4)
+        return base64.urlsafe_b64decode((u_b64 + pad).encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _get_authenticated_username(request: Request) -> str | None:
+    cookie_val = request.cookies.get(SESSION_COOKIE_NAME, "")
+    uname = _verify_token("session", cookie_val)
+    if not uname:
+        return None
+    return uname if get_user_by_username(uname) else None
+
+
+def _has_valid_api_key_or_session(request: Request) -> bool:
+    provided = clean_val(request.headers.get("X-API-Key"))
+    if provided:
+        expected_key, _from_env = get_api_key()
+        if expected_key and hmac.compare_digest(provided, expected_key):
+            return True
+    return _get_authenticated_username(request) is not None
+
+
+def _unauthorized_html() -> HTMLResponse:
+    return HTMLResponse(
+        content="<!DOCTYPE html><html lang='fr'><body style='font-family:sans-serif;padding:40px;background:#0b1212;color:#e6edf3;'>"
+        "<h3>Accès non autorisé</h3><p>Connectez-vous à ChemBase pour consulter ce document.</p>"
+        "<a href='/' style='color:#38bdf8;'>← Retour à ChemBase</a></body></html>",
+        status_code=401,
+    )
+
+
+@app.get("/api/session/establish")
+def establish_session_cookie(token: str = ""):
+    uname = _verify_token("ticket", token)
+    if not uname:
+        return Response(status_code=403)
+    resp = Response(status_code=204)
+    resp.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=_sign_token("session", uname, SESSION_TTL_SECONDS),
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=IS_RENDER,
+        path="/",
+    )
+    return resp
+
+
+@app.post("/api/session/clear")
+def clear_session_cookie():
+    resp = Response(status_code=204)
+    resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+    return resp
+
+
+# ------------------------------------------------------------------
+# ROUTES PROTÉGÉES (3D, ÉTIQUETTES, IMPRESSION PDF, PIÈCES JOINTES & API)
 # ------------------------------------------------------------------
 @app.get("/api/3d", response_class=HTMLResponse)
-def serve_3d_viewer(cas: str = "", dark: int = 1):
+def serve_3d_viewer(request: Request, cas: str = "", dark: int = 1):
+    if not _get_authenticated_username(request):
+        return _unauthorized_html()
     return HTMLResponse(content=build_3dmol_html(cas, dark_mode=bool(dark)))
 
 
 @app.get("/api/label", response_class=HTMLResponse)
 def serve_bottle_label(
+    request: Request,
     nom: str = "",
     cas: str = "",
     formule: str = "",
@@ -59,6 +156,9 @@ def serve_bottle_label(
     stockage: str = "",
     op: str = "chercheur",
 ):
+    uname = _get_authenticated_username(request)
+    if not uname:
+        return _unauthorized_html()
     return HTMLResponse(
         content=generate_bottle_label_html(
             nom=nom,
@@ -66,13 +166,15 @@ def serve_bottle_label(
             formule=formule,
             pictos=pictos,
             stockage=stockage,
-            operateur=op,
+            operateur=op or uname,
         )
     )
 
 
 @app.get("/api/print/fiche/{synth_id}", response_class=HTMLResponse)
-def serve_print_fiche(synth_id: int):
+def serve_print_fiche(request: Request, synth_id: int):
+    if not _get_authenticated_username(request):
+        return _unauthorized_html()
     row = next((r for r in get_all_syntheses() if int(r["id"]) == int(synth_id)), None)
     if not row:
         return HTMLResponse(content="<html><body><h3>Fiche introuvable.</h3></body></html>", status_code=404)
@@ -80,16 +182,36 @@ def serve_print_fiche(synth_id: int):
 
 
 @app.get("/api/print/labo/{entry_id}", response_class=HTMLResponse)
-def serve_print_labo(entry_id: int):
+def serve_print_labo(request: Request, entry_id: int):
+    if not _get_authenticated_username(request):
+        return _unauthorized_html()
     entry = next((e for e in get_all_labo_entries() if int(e["id"]) == int(entry_id)), None)
     if not entry:
         return HTMLResponse(content="<html><body><h3>Essai introuvable.</h3></body></html>", status_code=404)
     return HTMLResponse(content=generate_labo_entry_html(entry))
 
 
+@app.get("/api/labo/attachment/{entry_id}")
+def serve_labo_attachment(request: Request, entry_id: int):
+    if not _get_authenticated_username(request):
+        return _unauthorized_html()
+    att = get_labo_attachment(entry_id)
+    if not att:
+        return HTMLResponse(content="<html><body><h3>Pièce jointe introuvable.</h3></body></html>", status_code=404)
+    fname, mime, raw_bytes = att
+    safe_name = sanitize_filename(fname) or f"attachment_{entry_id}"
+    return Response(
+        content=raw_bytes,
+        media_type=mime,
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+    )
+
+
 @app.get("/api/v1/catalog")
-def api_v1_catalog(q: str = ""):
-    """Point d'entrée JSON léger pour le futur module externe ChemStudio."""
+def api_v1_catalog(request: Request, q: str = ""):
+    """Point d'entrée JSON sécurisé (X-API-Key ou session active) pour le futur ChemStudio."""
+    if not _has_valid_api_key_or_session(request):
+        return JSONResponse(content={"error": "Clé X-API-Key invalide ou session manquante"}, status_code=401)
     q_low = clean_val(q).lower()
     rows = get_all_syntheses()
     items = []
@@ -111,8 +233,10 @@ def api_v1_catalog(q: str = ""):
 
 
 @app.get("/api/v1/molecule/{cas}")
-def api_v1_molecule(cas: str):
-    """Détail JSON d'une molécule par CAS pour le futur ChemStudio."""
+def api_v1_molecule(request: Request, cas: str):
+    """Détail JSON d'une molécule par CAS (X-API-Key ou session active) pour le futur ChemStudio."""
+    if not _has_valid_api_key_or_session(request):
+        return JSONResponse(content={"error": "Clé X-API-Key invalide ou session manquante"}, status_code=401)
     target = clean_val(cas).lower()
     row = next((r for r in get_all_syntheses() if clean_val(r.get("Numéro CAS")).lower() == target), None)
     if not row:
@@ -173,6 +297,15 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
     page_root = ui.element("div").style("width:100%;min-height:100vh;")
     active_refresh_hooks: dict[str, Any] = {}
 
+    def sync_http_cookie(username: str):
+        ticket = _sign_token("ticket", username, 60)
+        ui.run_javascript(
+            f'fetch("/api/session/establish?token={urllib.parse.quote(ticket)}", {{credentials: "same-origin"}});'
+        )
+
+    def clear_http_cookie():
+        ui.run_javascript('fetch("/api/session/clear", {method: "POST", credentials: "same-origin"});')
+
     def toggle_theme():
         state["dark"] = not state["dark"]
         app.storage.user["dark"] = state["dark"]
@@ -194,6 +327,7 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
     def render_auth_portal():
         page_root.clear()
         active_refresh_hooks.clear()
+        clear_http_cookie()
         auth_mode: dict[str, str] = {"view": "login"}
 
         with page_root:
@@ -343,12 +477,13 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
         is_root = bool(auth_user.get("is_root", False))
         uname = str(auth_user["username"])
 
+        sync_http_cookie(uname)
+
         tab_buttons: dict[str, Any] = {}
         tab_panels: dict[str, Any] = {}
         labo_bridge: dict[str, Any] = {"select": None}
 
         with page_root:
-            # --- MODALE « MON COMPTE » (CHANGEMENT DE MOT DE PASSE AUTONOME) ---
             account_dialog = ui.dialog().props('transition-show="fade" transition-hide="fade"')
             with account_dialog:
                 account_body = ui.element("div").classes("cb-inspector-card").style("width:min(460px, 92vw) !important;")
@@ -393,6 +528,7 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
                 state["username"] = ""
                 state["tab"] = "recherche"
                 app.storage.user["auth_username"] = ""
+                clear_http_cookie()
                 ui.notify("Vous avez été déconnecté.", type="info")
                 render_auth_portal()
 
@@ -426,7 +562,6 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
                 if state["tab"] != "recherche":
                     switch_tab("recherche")
 
-            # --- SPOTLIGHT RECHERCHE RAPIDE (Ctrl + K · ↑ / ↓ / ↵) ---
             spotlight_dialog = ui.dialog().props('transition-show="fade" transition-hide="fade"')
             with spotlight_dialog:
                 with ui.element("div").classes("cb-spotlight-card"):
@@ -440,7 +575,6 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
                     ).props("outlined dense clearable autofocus").style("width:100%;margin-bottom:12px;")
                     spot_results = ui.element("div").props('id="spotlight-results"').style("max-height:360px;overflow-y:auto;")
 
-            # --- COQUE PRINCIPALE ---
             with ui.element("div").classes("app-shell"):
                 with ui.element("header").classes("top-header"):
                     with ui.element("div").classes("brand-group"):
@@ -466,7 +600,6 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
 
                         status_slot = ui.element("div")
 
-                        # Badge Utilisateur connecté (ouvre Mon compte) + Déconnexion
                         with (
                             ui.element("button")
                             .classes("user-pill")
@@ -652,7 +785,6 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
 
                 refresh_chrome()
 
-                # Pont externe (ChemStudio) : pré-remplit Nouvelle Fiche si paramètres URL fournis
                 if any(pending_prefill.values()):
                     c_p, n_p, s_p = pending_prefill["cas"], pending_prefill["name"], pending_prefill["smiles"]
                     pending_prefill.update(cas="", name="", smiles="")
@@ -664,7 +796,7 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
                     """
                     <footer class="app-footer">
                       <span>CHEMBASE R&amp;D PLATFORM · 100 % PYTHON (NICEGUI)</span>
-                      <span>ACCÈS AUTHENTIFIÉ · TRAÇABILITÉ &amp; API READY (CHEMSTUDIO)</span>
+                      <span>ACCÈS AUTHENTIFIÉ · TRAÇABILITÉ &amp; API SÉCURISÉE (CHEMSTUDIO)</span>
                     </footer>
                     """
                 )
@@ -680,14 +812,13 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
 
 if __name__ in {"__main__", "__mp_main__"}:
     port = int(os.environ.get("PORT", 8080))
-    is_render = os.environ.get("RENDER") is not None
     ui.run(
         host="0.0.0.0",
         port=port,
         title="ChemBase — R&D, Cahier de Laboratoire & Stocks",
         favicon=find_favicon(),
         dark=True,
-        storage_secret=os.environ.get("STORAGE_SECRET", "chembase-swiss-biotech-2026"),
-        reload=not is_render,
-        show=not is_render,
+        storage_secret=STORAGE_SECRET,
+        reload=not IS_RENDER,
+        show=not IS_RENDER,
     )

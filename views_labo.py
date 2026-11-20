@@ -1,16 +1,14 @@
 import html
-import os
+import mimetypes
 from datetime import datetime
 from typing import Any
 from nicegui import run, ui
 
 from chem_data import (
-    LABO_FILES_DIR,
     clean_val,
     export_styled_table,
     get_known_density,
     get_molecular_weight,
-    sanitize_filename,
 )
 from database import (
     deduct_inventory_by_name,
@@ -22,8 +20,8 @@ from database import (
 )
 from theme import safe_html
 
-os.makedirs(LABO_FILES_DIR, exist_ok=True)
 STATUTS_ESSAI = ["Validé", "En cours", "À optimiser", "Échec"]
+MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024  # 3 Mo max pour garder SQLite et GitHub rapides
 
 
 def _btn(label_html: str, classes: str = "glass-btn", on_click=None, style: str = "", props: str = ""):
@@ -102,8 +100,9 @@ def build_labo_view(app_state: dict[str, Any], on_data_changed=None):
 
         calc_state: dict[str, Any] = {
             "last_items": [],
-            "uploaded_rel_path": "",
             "uploaded_name": "",
+            "uploaded_mime": "",
+            "uploaded_bytes": None,
         }
 
         def current_user() -> str:
@@ -186,28 +185,36 @@ def build_labo_view(app_state: dict[str, Any], on_data_changed=None):
                 async def handle_upload(e):
                     try:
                         if hasattr(e, "file"):
-                            orig_name = e.file.name
+                            orig_name = str(e.file.name)
                             raw_bytes = await e.file.read()
+                            mime_type = getattr(e.file, "content_type", "") or ""
                         else:
-                            orig_name = getattr(e, "name", "spectre.bin")
+                            orig_name = str(getattr(e, "name", "spectre.bin"))
                             raw_bytes = e.content.read()
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        safe_name = f"{ts}_{sanitize_filename(orig_name)}"
-                        dest = os.path.join(LABO_FILES_DIR, safe_name)
-                        with open(dest, "wb") as f:
-                            f.write(raw_bytes)
-                        calc_state["uploaded_rel_path"] = f"/images/labo_attachments/{safe_name}"
+                            mime_type = str(getattr(e, "type", "") or "")
+
+                        if len(raw_bytes) > MAX_ATTACHMENT_BYTES:
+                            ui.notify("Fichier trop volumineux (maximum 3 Mo pour la persistance SQLite / Render).", type="negative")
+                            return
+
+                        final_mime = mime_type or mimetypes.guess_type(orig_name)[0] or "application/octet-stream"
                         calc_state["uploaded_name"] = orig_name
+                        calc_state["uploaded_mime"] = final_mime
+                        calc_state["uploaded_bytes"] = bytes(raw_bytes)
+                        size_kb = len(raw_bytes) / 1024.0
                         upload_status.clear()
                         with upload_status:
-                            safe_html(f'<span class="stock-pill stock-ok">Pièce jointe prête : {html.escape(orig_name)}</span>')
+                            safe_html(
+                                f'<span class="stock-pill stock-ok">Stocké dans SQLite : {html.escape(orig_name)} ({size_kb:.0f} Ko)</span>'
+                            )
                     except Exception as ex:
                         ui.notify(f"Erreur lors de l'import : {ex}", type="negative")
 
                 ui.upload(
-                    label="Joindre un spectre / CCM / PDF (optionnel)",
+                    label="Joindre un spectre / CCM / PDF (max 3 Mo · persistant SQLite)",
                     auto_upload=True,
                     max_files=1,
+                    max_file_size=MAX_ATTACHMENT_BYTES,
                     on_upload=handle_upload,
                 ).props("flat bordered color=cyan").style("margin-top:10px;width:100%;")
 
@@ -234,10 +241,13 @@ def build_labo_view(app_state: dict[str, Any], on_data_changed=None):
                         rendement_theorique=rdt_theo,
                         statut=in_statut.value or "Validé",
                         observations=clean_val(in_obs.value),
-                        attachment_path=str(calc_state["uploaded_rel_path"]),
+                        attachment_name=str(calc_state["uploaded_name"]),
+                        attachment_mime=str(calc_state["uploaded_mime"]),
+                        attachment_data=calc_state["uploaded_bytes"],
                     )
-                    calc_state["uploaded_rel_path"] = ""
                     calc_state["uploaded_name"] = ""
+                    calc_state["uploaded_mime"] = ""
+                    calc_state["uploaded_bytes"] = None
                     upload_status.clear()
                     in_obs.value = ""
                     ui.notify(f"Essai « {cible} » ({rdt_reel:.1f} %) archivé sous {op_locked}.", type="positive")
@@ -460,11 +470,15 @@ def build_labo_view(app_state: dict[str, Any], on_data_changed=None):
                         can_delete = me_super or (op_entry.lower() == me.lower())
                         st_v = clean_val(ent.get("statut"))
                         st_cls = "stock-ok" if st_v == "Validé" else ("stock-empty" if st_v == "Échec" else "stock-low")
-                        att = clean_val(ent.get("attachment_path"))
-                        att_link = ""
-                        if att:
-                            href = att if att.startswith("/") else f"/images/labo_attachments/{os.path.basename(att)}"
-                            att_link = f'<a class="glass-btn" style="text-decoration:none;padding:4px 10px;font-size:0.74rem;" href="{href}" target="_blank">Pièce jointe ↗</a>'
+
+                        has_attachment = bool(ent.get("has_blob")) or bool(clean_val(ent.get("attachment_path")))
+                        att_lbl = clean_val(ent.get("attachment_name")) or "Pièce jointe"
+                        att_link = (
+                            f'<a class="glass-btn" style="text-decoration:none;padding:4px 10px;font-size:0.74rem;" '
+                            f'href="/api/labo/attachment/{ent_id}" target="_blank" title="{html.escape(att_lbl)}">Pièce jointe ↗</a>'
+                            if has_attachment
+                            else ""
+                        )
                         print_link = f'<a class="glass-btn" style="text-decoration:none;padding:4px 10px;font-size:0.74rem;" href="/api/print/labo/{ent_id}" target="_blank">Imprimer / PDF</a>'
                         obs_txt = clean_val(ent.get("observations"))
                         obs_html = f'<div class="muted-small" style="margin-top:4px;color:var(--txt);">Notes : {html.escape(obs_txt)}</div>' if obs_txt else ""
