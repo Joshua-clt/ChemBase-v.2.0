@@ -9,6 +9,8 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from nicegui import app, ui
+import threading
+import urllib.request
 
 from chem_data import (
     LABO_FILES_DIR,
@@ -135,7 +137,31 @@ def clear_session_cookie():
     resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
     return resp
 
+_LAST_STUDIO_WAKE = 0.0
 
+
+def _wake_chemstudio_async():
+    global _LAST_STUDIO_WAKE
+    studio_url = clean_val(os.environ.get("CHEMSTUDIO_URL", "")).rstrip("/")
+    if not studio_url:
+        return
+    now = time.time()
+    if now - _LAST_STUDIO_WAKE < 300:
+        return
+    _LAST_STUDIO_WAKE = now
+
+    def _ping():
+        try:
+            urllib.request.urlopen(f"{studio_url}/api/ping", timeout=15)
+        except Exception:
+            pass
+
+    threading.Thread(target=_ping, daemon=True).start()
+
+
+@app.get("/api/ping")
+def api_ping():
+    return JSONResponse(content={"ok": True, "app": "ChemBase"})
 # ------------------------------------------------------------------
 # ROUTES PROTÉGÉES (3D, ÉTIQUETTES, IMPRESSION PDF, PIÈCES JOINTES & API)
 # ------------------------------------------------------------------
@@ -273,6 +299,7 @@ def find_favicon() -> str:
 @ui.page("/")
 def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
     inject_theme()
+    _wake_chemstudio_async()
 
     saved_dark = bool(app.storage.user.get("dark", True))
     saved_user_name = str(app.storage.user.get("auth_username", "") or "")
