@@ -1,4 +1,3 @@
-from functools import lru_cache
 import html
 import json
 import os
@@ -7,6 +6,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from functools import lru_cache
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMG_DIR = os.path.join(BASE_DIR, "images")
@@ -550,7 +550,7 @@ def fetch_full_pubchem_by_cas(cas_str: str):
         try:
             url_ghs = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/{cid}/JSON?heading=GHS+Classification"
             with urllib.request.urlopen(urllib.request.Request(url_ghs, headers={"User-Agent": "ChemBase-App"}), timeout=6) as rg:
-                ghs_nums = sorted(list(set(re.findall(r"GHS0([1-9])", rg.read().decode("utf-8")))))
+                ghs_nums = sorted(set(re.findall(r"GHS0([1-9])", rg.read().decode("utf-8"))))
                 res["pictos"] = [f"SGH0{n} - {SGH_DICT[f'SGH0{n}'][0]}" for n in ghs_nums if f"SGH0{n}" in SGH_DICT]
         except Exception:
             pass
@@ -658,7 +658,7 @@ def fetch_reactant_inspector_data(reactant_name: str) -> dict:
             try:
                 url_ghs = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/{cid}/JSON?heading=GHS+Classification"
                 with urllib.request.urlopen(urllib.request.Request(url_ghs, headers={"User-Agent": "ChemBase-App"}), timeout=5) as rg:
-                    ghs_nums = sorted(list(set(re.findall(r"GHS0([1-9])", rg.read().decode("utf-8")))))
+                    ghs_nums = sorted(set(re.findall(r"GHS0([1-9])", rg.read().decode("utf-8"))))
                     data["pictos"] = ", ".join([f"SGH0{n}" for n in ghs_nums if f"SGH0{n}" in SGH_DICT])
             except Exception:
                 pass

@@ -1,7 +1,7 @@
 import html
 import urllib.parse
+
 from nicegui import ui
-from typing import Any
 
 from chem_data import clean_val, export_styled_table, get_known_density
 from database import (
@@ -482,8 +482,7 @@ def build_stocks_view(app_state: dict, on_data_changed=None):
             filters["q"] = term
             refresh_table()
 
-        focus_hook: dict[str, Any] = {"set_search": None}
-
+        
         q_in.on_value_change(lambda e: (filters.update(q=e.value or ""), refresh_table()))
         cat_sel.on_value_change(lambda e: (filters.update(cat=e.value or "Toutes"), refresh_table()))
         low_chk.on_value_change(lambda e: (filters.update(low_only=bool(e.value)), refresh_table()))

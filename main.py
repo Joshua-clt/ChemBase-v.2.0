@@ -3,14 +3,15 @@ import hashlib
 import hmac
 import html
 import os
+import threading
 import time
 import urllib.parse
+import urllib.request
 from typing import Any
+
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from nicegui import app, ui
-import threading
-import urllib.request
 
 from chem_data import (
     LABO_FILES_DIR,
@@ -838,7 +839,7 @@ def index_page(new_cas: str = "", new_name: str = "", new_smiles: str = ""):
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", "8080"))
     ui.run(
         host="0.0.0.0",
         port=port,

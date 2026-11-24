@@ -15,7 +15,13 @@ import urllib.request
 from datetime import datetime
 from typing import Any
 
-from chem_data import BASE_COLS, FAST_DENSITY_MAP, LABO_FILES_DIR, clean_val, get_known_density
+from chem_data import (
+    BASE_COLS,
+    FAST_DENSITY_MAP,
+    LABO_FILES_DIR,
+    clean_val,
+    get_known_density,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "chimie_db.sqlite")
@@ -764,9 +770,7 @@ def quick_stock_movement(
             converted = amt / dens
         elif u_in == "ml" and u_st == "g":
             converted = amt * dens
-        elif u_in == "g" and u_st == "kg":
-            converted = amt / 1000.0
-        elif u_in == "ml" and u_st == "l":
+        elif u_in == "g" and u_st == "kg" or u_in == "ml" and u_st == "l":
             converted = amt / 1000.0
         elif u_in == "g" and u_st == "l" and dens > 0:
             converted = (amt / dens) / 1000.0

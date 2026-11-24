@@ -2,6 +2,7 @@ import html
 import mimetypes
 from datetime import datetime
 from typing import Any
+
 from nicegui import run, ui
 
 from chem_data import (

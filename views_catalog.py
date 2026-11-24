@@ -1,8 +1,9 @@
 import html
 import json
 import re
-from typing import Any
 import urllib.parse
+from typing import Any
+
 from nicegui import run, ui
 
 from chem_data import (
